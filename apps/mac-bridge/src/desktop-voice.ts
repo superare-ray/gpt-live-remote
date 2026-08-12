@@ -72,23 +72,14 @@ const shortcutScript = String.raw`
 on run argv
   set appBundleId to item 1 of argv
   set shortcutKey to item 2 of argv
-  set useCommand to item 3 of argv is "true"
-  set useControl to item 4 of argv is "true"
-  set useOption to item 5 of argv is "true"
-  set useShift to item 6 of argv is "true"
-  set modifiers to {}
-  if useCommand then set end of modifiers to command down
-  if useControl then set end of modifiers to control down
-  if useOption then set end of modifiers to option down
-  if useShift then set end of modifiers to shift down
   tell application "System Events"
     set targetProcess to first application process whose bundle identifier is appBundleId
     set frontmost of targetProcess to true
     delay 0.25
     if shortcutKey is "space" then
-      keystroke " " using modifiers
+      keystroke " " using {__MODIFIERS__}
     else
-      keystroke shortcutKey using modifiers
+      keystroke shortcutKey using {__MODIFIERS__}
     end if
   end tell
 end run
@@ -106,17 +97,6 @@ on run argv
       try
         set output to output & "AXWindowTitle=" & (name of windowRef as text) & linefeed
       end try
-      set allElements to entire contents of windowRef
-      repeat with elementRef in allElements
-        set rowText to ""
-        repeat with attributeName in {"AXRole", "AXSubrole", "AXIdentifier", "AXTitle", "AXDescription", "AXValue", "AXHelp"}
-          try
-            set attributeValue to value of attribute (contents of attributeName) of elementRef
-            if attributeValue is not missing value then set rowText to rowText & (contents of attributeName) & "=" & (attributeValue as text) & tab
-          end try
-        end repeat
-        if rowText is not "" then set output to output & rowText & linefeed
-      end repeat
     end repeat
     return output
   end tell
@@ -132,15 +112,15 @@ export async function readAccessibilitySnapshot(bundleId: string) {
 
 async function triggerShortcut(config: DesktopVoiceConfig) {
   await execFileAsync("/usr/bin/open", ["-b", config.bundleId]);
+  const modifiers = ["command", "control", "option", "shift"]
+    .filter((modifier) => config.shortcutModifiers.has(modifier as "command" | "control" | "option" | "shift"))
+    .map((modifier) => `${modifier} down`)
+    .join(", ");
   await execFileAsync("/usr/bin/osascript", [
     "-e",
-    shortcutScript,
+    shortcutScript.replaceAll("__MODIFIERS__", modifiers),
     config.bundleId,
     config.shortcutKey,
-    String(config.shortcutModifiers.has("command")),
-    String(config.shortcutModifiers.has("control")),
-    String(config.shortcutModifiers.has("option")),
-    String(config.shortcutModifiers.has("shift")),
   ]);
 }
 
@@ -149,6 +129,10 @@ export async function startAndVerifyVoice(config: DesktopVoiceConfig) {
   if (!preflight.appInstalled) throw new Error("chatgpt_app_not_found");
   if (!preflight.accessibilityEnabled) throw new Error("accessibility_permission_missing");
 
+  if (config.activePattern) {
+    const currentSnapshot = await readAccessibilitySnapshot(config.bundleId);
+    if (config.activePattern.test(currentSnapshot)) return { verified: true, preflight };
+  }
   await triggerShortcut(config);
   const deadline = Date.now() + config.timeoutMs;
   if (!config.activePattern) {
