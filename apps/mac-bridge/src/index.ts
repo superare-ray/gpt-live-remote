@@ -5,6 +5,7 @@ import { createInterface } from "node:readline/promises";
 import process from "node:process";
 import qrcode from "qrcode-terminal";
 import WebSocket from "ws";
+import { desktopVoiceConfigFromEnv, startAndVerifyVoice } from "./desktop-voice.js";
 
 type DeviceConfig = { id: string; name: string; kind: "macbook" | "macmini"; secret: string };
 type ServerMessage =
@@ -100,8 +101,17 @@ socket.on("message", async (raw) => {
     console.log(answer.trim().toLowerCase() === "y" ? "✓ 已批准配对\n" : "已拒绝配对\n");
   } else if (message.type === "session.start") {
     console.log(`\n▶ 收到启动请求 ${message.sessionId.slice(0, 8)}`);
-    console.log("  控制链路验证完成；当前开发版暂不启动 ChatGPT Voice。\n");
-    socket.send(JSON.stringify({ type: "session.ready", sessionId: message.sessionId }));
+    console.log("  正在激活 ChatGPT 并验证 Voice 界面状态…");
+    try {
+      const config = desktopVoiceConfigFromEnv();
+      await startAndVerifyVoice(config);
+      console.log("✓ ChatGPT Voice 界面已验证\n");
+      socket.send(JSON.stringify({ type: "session.ready", sessionId: message.sessionId }));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "desktop_start_failed";
+      console.error(`✗ ChatGPT Voice 启动未确认：${reason}\n`);
+      socket.send(JSON.stringify({ type: "session.failed", sessionId: message.sessionId, reason }));
+    }
   } else if (message.type === "session.ptt") {
     console.log(message.active ? "🎙 手机正在按住说话" : "✓ 手机已松开说话按钮");
   } else if (message.type === "session.text") {

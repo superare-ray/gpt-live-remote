@@ -28,9 +28,18 @@ type Device = {
   status: "online" | "offline";
   lastSeen: string | null;
 };
-type RemoteSession = { id: string; deviceId: string; status: "starting" | "ready" | "failed" };
+type RemoteSession = { id: string; deviceId: string; status: "starting" | "ready" | "failed"; failureReason?: string | null };
 type Mode = "voice" | "text";
 const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
+const sessionFailureMessages: Record<string, string> = {
+  voice_shortcut_not_configured: "Mac 尚未配置 Voice 快捷键",
+  voice_shortcut_modifiers_invalid: "Mac 的 Voice 快捷键配置无效",
+  voice_state_probe_not_configured: "Mac 尚未完成 Voice 状态标定",
+  voice_state_probe_pattern_invalid: "Mac 的 Voice 状态标定无效",
+  chatgpt_app_not_found: "Mac 上未找到支持 Voice 的 ChatGPT Desktop",
+  accessibility_permission_missing: "Mac Bridge 缺少辅助功能权限",
+  voice_ui_state_unverified: "已触发快捷键，但未确认 Voice 界面启动",
+};
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${appBasePath}${path}`, {
@@ -146,7 +155,7 @@ export default function Home() {
         } else if (latest.session.status === "failed") {
           if (pollRef.current) clearInterval(pollRef.current);
           setConnectingId(null);
-          setNotice("连接失败，请确认 Mac Bridge 正在运行");
+          setNotice(sessionFailureMessages[latest.session.failureReason || ""] || "连接失败，请检查 Mac Bridge 的诊断信息");
         }
       };
       await poll();

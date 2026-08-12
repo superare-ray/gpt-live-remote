@@ -83,6 +83,11 @@ db.exec(`
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
 `);
+try {
+  db.exec("ALTER TABLE remote_sessions ADD COLUMN failure_reason TEXT");
+} catch (error) {
+  if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
+}
 
 type User = { id: string; email: string };
 type BridgeMessage =
@@ -272,8 +277,13 @@ app.get("/api/v1/bridge/ws", { websocket: true }, (socket, request) => {
           db.prepare("UPDATE pairing_requests SET status = 'rejected' WHERE id = ?").run(pending.id);
         }
       } else if (message.type === "session.ready" || message.type === "session.failed") {
-        db.prepare("UPDATE remote_sessions SET status = ? WHERE id = ? AND device_id = ?")
-          .run(message.type === "session.ready" ? "ready" : "failed", message.sessionId, device.id);
+        db.prepare("UPDATE remote_sessions SET status = ?, failure_reason = ? WHERE id = ? AND device_id = ?")
+          .run(
+            message.type === "session.ready" ? "ready" : "failed",
+            message.type === "session.failed" ? message.reason || "desktop_start_failed" : null,
+            message.sessionId,
+            device.id,
+          );
       }
     } catch (error) {
       request.log.warn({ error }, "invalid bridge message");
@@ -351,7 +361,7 @@ app.get("/api/v1/sessions/:id", async (request, reply) => {
   if (!user) return;
   const id = z.string().uuid().safeParse((request.params as { id?: string }).id);
   if (!id.success) return reply.code(400).send({ error: "会话信息无效" });
-  const session = db.prepare("SELECT id, device_id as deviceId, status FROM remote_sessions WHERE id = ? AND user_id = ?").get(id.data, user.id);
+  const session = db.prepare("SELECT id, device_id as deviceId, status, failure_reason as failureReason FROM remote_sessions WHERE id = ? AND user_id = ?").get(id.data, user.id);
   if (!session) return reply.code(404).send({ error: "找不到会话" });
   return { session };
 });
