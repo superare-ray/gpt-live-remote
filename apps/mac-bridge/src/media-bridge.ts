@@ -37,6 +37,19 @@ async function avFoundationAudioIndex(ffmpegPath: string, deviceName: string) {
   throw new Error(`audio_device_not_found:${deviceName}`);
 }
 
+async function audioToolboxOutputIndex(ffmpegPath: string, deviceName: string) {
+  const result = await execFileAsync(ffmpegPath, [
+    "-hide_banner", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "0.01",
+    "-list_devices", "true", "-f", "audiotoolbox", "-",
+  ], { maxBuffer: 1024 * 1024 }).catch((error: unknown) => error as { stderr?: string });
+  const output = "stderr" in result ? result.stderr || "" : "";
+  for (const line of output.split("\n")) {
+    const match = line.match(/\[(\d+)]\s+(.+?),\s+\S+$/);
+    if (match?.[2]?.trim() === deviceName) return Number(match[1]);
+  }
+  throw new Error(`audio_output_device_not_found:${deviceName}`);
+}
+
 function waitForExit(child: ChildProcessWithoutNullStreams, label: string) {
   child.once("exit", (code, signal) => {
     if (code && signal !== "SIGTERM") console.error(`${label} exited (${code})`);
@@ -53,6 +66,9 @@ export class MacAudioBridge {
   private pendingCapture = Buffer.alloc(0);
   private remoteStream: AudioStream | null = null;
   private closed = false;
+  private pttActive = false;
+  private pttFrameCount = 0;
+  private pttPeak = 0;
   private previousDefaults: { inputUid: string; outputUid: string } | null = null;
 
   private async setSessionAudioDefaults(input: string, output: string) {
@@ -64,19 +80,19 @@ export class MacAudioBridge {
 
   async connect(credentials: MediaCredentials) {
     const ffmpegPath = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
-    const ffplayPath = process.env.FFPLAY_PATH || "/opt/homebrew/bin/ffplay";
     const phoneToChatGptDevice = process.env.PHONE_TO_CHATGPT_DEVICE || "BlackHole 2ch";
     const chatGptToPhoneDevice = process.env.CHATGPT_TO_PHONE_DEVICE || "BlackHole 16ch";
-    const captureIndex = await avFoundationAudioIndex(ffmpegPath, chatGptToPhoneDevice);
+    const [playoutIndex, captureIndex] = await Promise.all([
+      audioToolboxOutputIndex(ffmpegPath, phoneToChatGptDevice),
+      avFoundationAudioIndex(ffmpegPath, chatGptToPhoneDevice),
+    ]);
     await this.setSessionAudioDefaults(phoneToChatGptDevice, chatGptToPhoneDevice);
 
-    this.playout = spawn(ffplayPath, [
-      "-nodisp", "-hide_banner", "-loglevel", "error",
-      "-f", "s16le", "-ar", String(sampleRate), "-ch_layout", "mono", "-i", "-",
-    ], {
-      env: { ...process.env, SDL_AUDIO_DEVICE_NAME: phoneToChatGptDevice },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    this.playout = spawn(ffmpegPath, [
+      "-hide_banner", "-loglevel", "error",
+      "-f", "s16le", "-ar", String(sampleRate), "-ac", String(channels), "-i", "pipe:0",
+      "-audio_device_index", String(playoutIndex), "-f", "audiotoolbox", "-",
+    ], { stdio: ["pipe", "pipe", "pipe"] });
     waitForExit(this.playout, "BlackHole playout");
 
     const remoteTrackReady = new Promise<void>((resolve, reject) => {
@@ -115,12 +131,30 @@ export class MacAudioBridge {
     try {
       for await (const frame of stream) {
         if (this.closed) break;
+        if (!this.pttActive) continue;
+        this.pttFrameCount += 1;
+        for (const sample of frame.data) this.pttPeak = Math.max(this.pttPeak, Math.abs(sample));
         const bytes = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
         if (!writer.write(bytes)) await once(writer, "drain");
       }
     } catch (error) {
       if (!this.closed) console.error(`Remote audio playout failed: ${(error as Error).message}`);
     }
+  }
+
+  setPtt(active: boolean) {
+    if (active === this.pttActive) return;
+    if (active) {
+      this.pttFrameCount = 0;
+      this.pttPeak = 0;
+      this.pttActive = true;
+      return;
+    }
+    this.pttActive = false;
+    const peakDb = this.pttPeak > 0
+      ? (20 * Math.log10(this.pttPeak / 32_768)).toFixed(1)
+      : "-∞";
+    console.log(`  媒体实测：${this.pttFrameCount} 帧，峰值 ${peakDb} dBFS`);
   }
 
   private enqueueCapturedAudio(chunk: Buffer) {
@@ -146,6 +180,7 @@ export class MacAudioBridge {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    this.pttActive = false;
     await this.remoteStream?.cancel().catch(() => null);
     this.playout?.kill("SIGTERM");
     this.capture?.kill("SIGTERM");

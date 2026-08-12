@@ -184,7 +184,6 @@ export default function Home() {
         noiseSuppression: true,
         autoGainControl: true,
       });
-      await localMic.mute();
       const result = await request<{ session: RemoteSession }>("/api/v1/sessions", {
         method: "POST",
         body: JSON.stringify({ deviceId: device.id }),
@@ -204,6 +203,18 @@ export default function Home() {
             element.remove();
             remoteAudioElementsRef.current = remoteAudioElementsRef.current.filter((candidate) => candidate !== element);
           });
+        });
+        room.on(RoomEvent.Disconnected, () => {
+          if (roomRef.current !== room) return;
+          roomRef.current = null;
+          micTrackRef.current?.stop();
+          micTrackRef.current = null;
+          remoteAudioElementsRef.current.forEach((element) => element.remove());
+          remoteAudioElementsRef.current = [];
+          setTalking(false);
+          setRemoteSession(null);
+          setActiveDevice(null);
+          setNotice("媒体连接已断开，请重新连接设备");
         });
         await room.connect(result.session.media.url, result.session.media.token, { autoSubscribe: true });
         await room.localParticipant.publishTrack(localMic, {
@@ -243,11 +254,6 @@ export default function Home() {
   async function setPtt(active: boolean) {
     if (!remoteSession || active === talking) return;
     setTalking(active);
-    const track = micTrackRef.current;
-    if (track) {
-      if (active) await track.unmute();
-      else await track.mute();
-    }
     await request(`/api/v1/sessions/${remoteSession.id}/ptt`, {
       method: "POST",
       body: JSON.stringify({ active }),
@@ -329,8 +335,8 @@ export default function Home() {
         {mode === "voice" ? (
           <section className="voice-stage">
             <p className="voice-status">{talking ? "正在发送到 Mac" : "按住按钮开始说话"}</p>
-            <div className={`wave ${talking ? "active" : ""}`} aria-hidden>
-              {Array.from({ length: 17 }, (_, index) => <i key={index} style={{ "--i": index } as React.CSSProperties} />)}
+            <div className={`voice-dots ${talking ? "active" : ""}`} aria-hidden>
+              <i /><i /><i />
             </div>
             <button className={`ptt ${talking ? "pressed" : ""}`} type="button" onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
               <Mic /> <span>{talking ? "正在说话" : "按住说话"}</span>

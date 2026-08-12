@@ -131,7 +131,21 @@ export async function startAndVerifyVoice(config: DesktopVoiceConfig) {
 
   if (config.activePattern) {
     const currentSnapshot = await readAccessibilitySnapshot(config.bundleId);
-    if (config.activePattern.test(currentSnapshot)) return { verified: true, preflight };
+    if (config.activePattern.test(currentSnapshot)) {
+      // A Voice window left over from an earlier remote session can retain the
+      // old CoreAudio devices. Close it first so the next start reacquires the
+      // BlackHole defaults selected by the media bridge.
+      await triggerShortcut(config);
+      const stopDeadline = Date.now() + config.timeoutMs;
+      let consecutiveStops = 0;
+      while (Date.now() < stopDeadline) {
+        const snapshot = await readAccessibilitySnapshot(config.bundleId);
+        consecutiveStops = config.activePattern.test(snapshot) ? 0 : consecutiveStops + 1;
+        if (consecutiveStops >= 2) break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      if (consecutiveStops < 2) throw new Error("voice_ui_stop_unverified");
+    }
   }
   await triggerShortcut(config);
   const deadline = Date.now() + config.timeoutMs;

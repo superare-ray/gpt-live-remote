@@ -83,10 +83,17 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .connection-line { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; }
 .voice-stage { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 36px 0 8px; }
 .voice-status { color: var(--sage); }
-.wave { height: 180px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 10px 0 42px; }
-.wave i { width: 5px; height: calc(20px + (var(--i) % 6) * 12px); border-radius: 10px; background: linear-gradient(var(--sage-strong), rgba(157,184,163,.24)); opacity: .38; transform: scaleY(.5); }
-.wave.active i { opacity: .9; animation: pulse .65s ease-in-out infinite alternate; animation-delay: calc(var(--i) * -45ms); }
-@keyframes pulse { to { transform: scaleY(1.65); } }
+.voice-dots { height: 150px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 13px; margin: 10px 0 42px; }
+.voice-dots i { --peak: 42px; width: 12px; height: 12px; border-radius: 999px; background: var(--sage-strong); opacity: .48; box-shadow: 0 0 20px rgba(184,207,188,.12); transform-origin: center; }
+.voice-dots i:nth-child(2) { --peak: 70px; }
+.voice-dots.active i { opacity: .96; animation: voice-dot-wave .78s cubic-bezier(.45,.05,.55,.95) infinite; }
+.voice-dots.active i:nth-child(1) { animation-delay: -.18s; }
+.voice-dots.active i:nth-child(2) { animation-delay: -.48s; }
+.voice-dots.active i:nth-child(3) { animation-delay: -.32s; }
+@keyframes voice-dot-wave {
+  0%, 100% { height: 12px; transform: translateY(0); }
+  48% { height: var(--peak); transform: translateY(-2px); }
+}
 .ptt { width: min(100%, 340px); min-height: 92px; border-radius: 999px; border: 1px solid rgba(184,207,188,.52); color: #07100d; background: var(--sage-strong); display: flex; align-items: center; justify-content: center; gap: 14px; font-size: 22px; font-weight: 800; touch-action: none; user-select: none; }
 .ptt.pressed { transform: scale(.98); background: #c9dbcc; box-shadow: 0 0 0 10px rgba(157,184,163,.08); }
 .helper { color: var(--muted); }
