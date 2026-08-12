@@ -1,0 +1,18 @@
+{
+  "name": "GPT-Live Remote",
+  "short_name": "GPT-Live",
+  "description": "从手机安全连接 Mac 上的 GPT-Live",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07100d",
+  "theme_color": "#07100d",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

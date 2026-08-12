@@ -1,0 +1,24 @@
+services:
+  control-api:
+    build:
+      context: ../services/control-api
+    container_name: gpt-live-control-api
+    restart: unless-stopped
+    env_file:
+      - /opt/gpt-live-remote/secrets/control.env
+    volumes:
+      - /opt/gpt-live-remote/data:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    mem_limit: 256m
+
+  pwa:
+    build:
+      context: ../apps/pwa
+    container_name: gpt-live-pwa
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:8790:3000"
+    mem_limit: 384m
