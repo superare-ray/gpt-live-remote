@@ -15,7 +15,6 @@ type ServerMessage =
   | { type: "pairing.request"; requestId: string; email: string; confirmationCode: string }
   | { type: "session.start"; sessionId: string; media?: { url: string; token: string } | null }
   | { type: "session.stop"; sessionId: string }
-  | { type: "session.ptt"; sessionId: string; active: boolean }
   | { type: "session.text"; sessionId: string; text: string };
 
 const apiBase = process.env.CONTROL_API_BASE?.replace(/\/$/, "");
@@ -151,9 +150,6 @@ socket.on("message", async (raw) => {
       console.error(`✗ GPT Voice 关闭未确认：${reason}\n`);
       socket.send(JSON.stringify({ type: "session.stop_failed", sessionId: message.sessionId, reason }));
     }
-  } else if (message.type === "session.ptt") {
-    activeMedia?.setPtt(message.active);
-    console.log(message.active ? "🎙 手机正在按住说话" : "✓ 手机已松开说话按钮");
   } else if (message.type === "session.text") {
     console.log(`✉ 手机文字：${message.text}`);
   }

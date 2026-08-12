@@ -5,6 +5,7 @@ The control protocol uses authenticated JSON messages over WSS. This package wil
 Current message families:
 
 - `bridge.hello`, `bridge.heartbeat`
+- `control.ready`, `control.heartbeat`, `control.heartbeat.ack`, `control.error`
 - `pairing.request`, `pairing.approve`, `pairing.reject`
 - `session.start`, `session.ready`, `session.failed`, `session.stop`, `session.stopped`, `session.stop_failed`
-- `session.ptt`, `session.text`
+- `session.text`

@@ -84,9 +84,6 @@ export class MacAudioBridge {
   private pendingCapture = Buffer.alloc(0);
   private remoteStream: AudioStream | null = null;
   private closed = false;
-  private pttActive = false;
-  private pttFrameCount = 0;
-  private pttPeak = 0;
   private replyPeak = 0;
   private lastReplyActivityAt = 0;
   private previousDefaults: { inputUid: string; outputUid: string } | null = null;
@@ -151,9 +148,6 @@ export class MacAudioBridge {
     try {
       for await (const frame of stream) {
         if (this.closed) break;
-        if (!this.pttActive) continue;
-        this.pttFrameCount += 1;
-        for (const sample of frame.data) this.pttPeak = Math.max(this.pttPeak, Math.abs(sample));
         const attenuated = new Int16Array(frame.data.length);
         for (let index = 0; index < frame.data.length; index += 1) {
           attenuated[index] = Math.round(frame.data[index] * phoneInputGain);
@@ -164,24 +158,6 @@ export class MacAudioBridge {
     } catch (error) {
       if (!this.closed) console.error(`Remote audio playout failed: ${(error as Error).message}`);
     }
-  }
-
-  setPtt(active: boolean) {
-    if (active === this.pttActive) return;
-    if (active) {
-      this.pttFrameCount = 0;
-      this.pttPeak = 0;
-      this.pttActive = true;
-      return;
-    }
-    this.pttActive = false;
-    const peakDb = this.pttPeak > 0
-      ? (20 * Math.log10(this.pttPeak / 32_768)).toFixed(1)
-      : "-∞";
-    const routedPeakDb = this.pttPeak > 0
-      ? (20 * Math.log10((this.pttPeak * phoneInputGain) / 32_768)).toFixed(1)
-      : "-∞";
-    console.log(`  媒体实测：${this.pttFrameCount} 帧，手机 ${peakDb} dBFS → GPT ${routedPeakDb} dBFS`);
   }
 
   private enqueueCapturedAudio(chunk: Buffer) {
@@ -218,7 +194,6 @@ export class MacAudioBridge {
   async close() {
     if (this.closed) return;
     this.closed = true;
-    this.pttActive = false;
     await this.remoteStream?.cancel().catch(() => null);
     await Promise.all([stopChild(this.playout), stopChild(this.capture)]);
     this.playout = null;

@@ -51,6 +51,7 @@ const sessionFailureMessages: Record<string, string> = {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${appBasePath}${path}`, {
+    cache: "no-store",
     ...init,
     credentials: "include",
     headers: { "content-type": "application/json", ...(init?.headers || {}) },
@@ -83,7 +84,6 @@ export default function Home() {
   const [messages, setMessages] = useState<Array<{ side: "user" | "system"; text: string }>>([]);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const roomRef = useRef<Room | null>(null);
   const micTrackRef = useRef<LocalAudioTrack | null>(null);
   const remoteAudioElementRef = useRef<HTMLAudioElement | null>(null);
@@ -94,8 +94,22 @@ export default function Home() {
   const remoteAnalyserRef = useRef<AnalyserNode | null>(null);
   const talkingRef = useRef(false);
   const activePointerRef = useRef<number | null>(null);
-  const pttQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const controlSocketRef = useRef<WebSocket | null>(null);
+  const controlSessionRef = useRef<string | null>(null);
+  const controlHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sessionIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [waveLevels, setWaveLevels] = useState<WaveLevels>([0, 0, 0]);
+
+  const closeSessionControl = useCallback(() => {
+    controlSessionRef.current = null;
+    if (controlHeartbeatRef.current) clearInterval(controlHeartbeatRef.current);
+    if (sessionIdleTimerRef.current) clearTimeout(sessionIdleTimerRef.current);
+    controlHeartbeatRef.current = null;
+    sessionIdleTimerRef.current = null;
+    const socket = controlSocketRef.current;
+    controlSocketRef.current = null;
+    if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "session closed");
+  }, []);
 
   const closeAudioGraph = useCallback(async () => {
     localAudioSourceRef.current?.disconnect();
@@ -127,12 +141,14 @@ export default function Home() {
     const room = roomRef.current;
     roomRef.current = null;
     if (room) await room.disconnect();
+    closeSessionControl();
     await closeAudioGraph();
-  }, [closeAudioGraph]);
+  }, [closeAudioGraph, closeSessionControl]);
 
   const loadDevices = useCallback(async () => {
     const result = await request<{ devices: Device[] }>("/api/v1/devices");
     setDevices(result.devices);
+    return result.devices;
   }, []);
 
   useEffect(() => {
@@ -152,24 +168,12 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    request<{ user: AuthUser }>("/api/v1/auth/me")
-      .then(({ user: current }) => {
-        setUser(current);
-        return loadDevices();
-      })
-      .catch(() => setUser(null))
-      .finally(() => setLoading(false));
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-      void disconnectMedia();
-    };
-  }, [disconnectMedia, loadDevices]);
-
-  useEffect(() => {
     const stopTalking = () => {
       if (document.visibilityState === "hidden" || !document.hasFocus()) {
         activePointerRef.current = null;
-        void setPtt(false);
+        talkingRef.current = false;
+        setTalking(false);
+        void micTrackRef.current?.mute().catch(() => null);
       }
     };
     document.addEventListener("visibilitychange", stopTalking);
@@ -217,6 +221,82 @@ export default function Home() {
     animationFrame = requestAnimationFrame(renderMeter);
     return () => cancelAnimationFrame(animationFrame);
   }, [activeDevice, remoteSession]);
+
+  function openSessionControl(sessionId: string): Promise<void> {
+    const current = controlSocketRef.current;
+    if (controlSessionRef.current === sessionId && current?.readyState === WebSocket.OPEN) return Promise.resolve();
+    controlSessionRef.current = sessionId;
+
+    return new Promise((resolve, reject) => {
+      const url = new URL(`${appBasePath}/api/v1/sessions/${sessionId}/ws`, window.location.origin);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(url);
+      controlSocketRef.current = socket;
+      let settled = false;
+      const connectTimeout = window.setTimeout(() => socket.close(4000, "connect timeout"), 6_000);
+
+      socket.onopen = () => {
+        window.clearTimeout(connectTimeout);
+        settled = true;
+        if (controlHeartbeatRef.current) clearInterval(controlHeartbeatRef.current);
+        controlHeartbeatRef.current = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "control.heartbeat" }));
+        }, 15_000);
+        resolve();
+      };
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(String(event.data)) as { type?: string; error?: string };
+          if (message.type === "control.error" && message.error === "bridge_offline") setNotice("Mac Bridge 已离线");
+        } catch {
+          // Ignore unknown status messages; the socket remains usable.
+        }
+      };
+      socket.onerror = () => {
+        if (!settled) reject(new Error("控制连接建立失败"));
+      };
+      socket.onclose = () => {
+        window.clearTimeout(connectTimeout);
+        if (controlSocketRef.current === socket) controlSocketRef.current = null;
+        if (controlHeartbeatRef.current) clearInterval(controlHeartbeatRef.current);
+        controlHeartbeatRef.current = null;
+        if (!settled) reject(new Error("控制连接建立失败"));
+        if (controlSessionRef.current !== sessionId) return;
+        controlSessionRef.current = null;
+        void disconnectMedia().finally(() => {
+          talkingRef.current = false;
+          setTalking(false);
+          setConnectingId(null);
+          setRemoteSession(null);
+          setActiveDevice(null);
+          setShowDevicePicker(true);
+          setNotice("连接已断开，请重新连接设备");
+        });
+      };
+    });
+  }
+
+  function armSessionIdleTimeout(sessionId: string) {
+    if (sessionIdleTimerRef.current) clearTimeout(sessionIdleTimerRef.current);
+    sessionIdleTimerRef.current = setTimeout(() => {
+      void request(`/api/v1/sessions/${sessionId}/stop`, { method: "POST", body: "{}" }).catch(() => null).finally(() => {
+        void disconnectMedia().finally(() => {
+          talkingRef.current = false;
+          setTalking(false);
+          setRemoteSession(null);
+          setActiveDevice(null);
+          setShowDevicePicker(true);
+        });
+      });
+    }, 10 * 60_000);
+  }
+
+  function sendSessionData(message: { type: "session.text"; text: string }) {
+    const socket = controlSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(message));
+    return true;
+  }
 
   async function sendLoginCode(event: FormEvent) {
     event.preventDefault();
@@ -283,6 +363,114 @@ export default function Home() {
     }
   }
 
+  async function joinSessionMedia(session: RemoteSession) {
+    if (!session.media) throw new Error("媒体服务尚未配置");
+    await disconnectMedia();
+
+    const audioContext = new AudioContext({ latencyHint: "interactive" });
+    audioContextRef.current = audioContext;
+    await audioContext.resume().catch(() => null);
+    const { createLocalAudioTrack, Room, RoomEvent, Track } = await import("livekit-client");
+    const localMic = await createLocalAudioTrack({
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    });
+    const localSource = audioContext.createMediaStreamSource(new MediaStream([localMic.mediaStreamTrack]));
+    const localAnalyser = audioContext.createAnalyser();
+    localAnalyser.fftSize = 256;
+    localAnalyser.smoothingTimeConstant = 0.72;
+    localSource.connect(localAnalyser);
+    localAudioSourceRef.current = localSource;
+    localAnalyserRef.current = localAnalyser;
+
+    await openSessionControl(session.id);
+    const room = new Room({ adaptiveStream: false, dynacast: false });
+    room.on(RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind !== Track.Kind.Audio) return;
+      const audioElement = remoteAudioElementRef.current;
+      if (audioElement) {
+        track.attach(audioElement);
+        audioElement.muted = false;
+        audioElement.volume = 1;
+        void audioElement.play().catch(() => null);
+      }
+      remoteAudioSourceRef.current?.disconnect();
+      remoteAnalyserRef.current?.disconnect();
+      try {
+        const remoteSource = audioContext.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+        const remoteAnalyser = audioContext.createAnalyser();
+        remoteAnalyser.fftSize = 256;
+        remoteAnalyser.smoothingTimeConstant = 0.72;
+        remoteSource.connect(remoteAnalyser);
+        remoteAudioSourceRef.current = remoteSource;
+        remoteAnalyserRef.current = remoteAnalyser;
+      } catch {
+        remoteAudioSourceRef.current = null;
+        remoteAnalyserRef.current = null;
+      }
+    });
+    room.on(RoomEvent.TrackUnsubscribed, (track) => {
+      if (track.kind !== Track.Kind.Audio) return;
+      const audioElement = remoteAudioElementRef.current;
+      if (audioElement) {
+        track.detach(audioElement);
+        audioElement.pause();
+        audioElement.srcObject = null;
+      }
+      remoteAudioSourceRef.current?.disconnect();
+      remoteAnalyserRef.current?.disconnect();
+      remoteAudioSourceRef.current = null;
+      remoteAnalyserRef.current = null;
+    });
+    room.on(RoomEvent.Disconnected, () => {
+      if (roomRef.current !== room) return;
+      roomRef.current = null;
+      micTrackRef.current?.stop();
+      micTrackRef.current = null;
+      closeSessionControl();
+      void closeAudioGraph();
+      talkingRef.current = false;
+      setTalking(false);
+      setRemoteSession(null);
+      setActiveDevice(null);
+      setShowDevicePicker(true);
+      setNotice("媒体连接已断开，请重新连接设备");
+    });
+    await room.connect(session.media.url, session.media.token, { autoSubscribe: true });
+    await room.localParticipant.publishTrack(localMic, {
+      name: "phone-microphone",
+      source: Track.Source.Microphone,
+    });
+    await localMic.mute();
+    roomRef.current = room;
+    micTrackRef.current = localMic;
+    await request(`/api/v1/sessions/${session.id}/media-ready`, { method: "POST", body: "{}" });
+  }
+
+  async function waitForSessionReady(sessionId: string) {
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const latest = await request<{ session: RemoteSession }>(`/api/v1/sessions/${sessionId}`);
+      if (latest.session.status === "ready") return latest.session;
+      if (latest.session.status === "failed") {
+        throw new Error(sessionFailureMessages[latest.session.failureReason || ""] || "连接失败，请检查 Mac Bridge 的诊断信息");
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 750));
+    }
+    throw new Error("连接超时，请重新连接设备");
+  }
+
+  async function activateSession(session: RemoteSession, device: Device) {
+    setConnectingId(device.id);
+    await joinSessionMedia(session);
+    const readySession = session.status === "ready" ? session : await waitForSessionReady(session.id);
+    setRemoteSession(readySession);
+    setActiveDevice(device);
+    setShowDevicePicker(false);
+    setConnectingId(null);
+    armSessionIdleTimeout(readySession.id);
+  }
+
   async function connectDevice(device: Device) {
     setConnectingId(device.id);
     setNotice(null);
@@ -295,106 +483,11 @@ export default function Home() {
       }
     }
     try {
-      const audioContext = new AudioContext({ latencyHint: "interactive" });
-      audioContextRef.current = audioContext;
-      const audioReady = audioContext.resume();
-      const { createLocalAudioTrack, Room, RoomEvent, Track } = await import("livekit-client");
-      await audioReady;
-      const localMic = await createLocalAudioTrack({
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      });
-      const localSource = audioContext.createMediaStreamSource(new MediaStream([localMic.mediaStreamTrack]));
-      const localAnalyser = audioContext.createAnalyser();
-      localAnalyser.fftSize = 256;
-      localAnalyser.smoothingTimeConstant = 0.72;
-      localSource.connect(localAnalyser);
-      localAudioSourceRef.current = localSource;
-      localAnalyserRef.current = localAnalyser;
       const result = await request<{ session: RemoteSession }>("/api/v1/sessions", {
         method: "POST",
         body: JSON.stringify({ deviceId: device.id }),
       });
-      if (result.session.media) {
-        const room = new Room({ adaptiveStream: false, dynacast: false });
-        room.on(RoomEvent.TrackSubscribed, (track) => {
-          if (track.kind !== Track.Kind.Audio) return;
-          const audioElement = remoteAudioElementRef.current;
-          if (audioElement) {
-            track.attach(audioElement);
-            audioElement.muted = false;
-            audioElement.volume = 1;
-            void audioElement.play().catch(() => null);
-          }
-          remoteAudioSourceRef.current?.disconnect();
-          remoteAnalyserRef.current?.disconnect();
-          try {
-            const remoteSource = audioContext.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
-            const remoteAnalyser = audioContext.createAnalyser();
-            remoteAnalyser.fftSize = 256;
-            remoteAnalyser.smoothingTimeConstant = 0.72;
-            remoteSource.connect(remoteAnalyser);
-            remoteAudioSourceRef.current = remoteSource;
-            remoteAnalyserRef.current = remoteAnalyser;
-          } catch {
-            remoteAudioSourceRef.current = null;
-            remoteAnalyserRef.current = null;
-          }
-        });
-        room.on(RoomEvent.TrackUnsubscribed, (track) => {
-          if (track.kind !== Track.Kind.Audio) return;
-          const audioElement = remoteAudioElementRef.current;
-          if (audioElement) {
-            track.detach(audioElement);
-            audioElement.pause();
-            audioElement.srcObject = null;
-          }
-          remoteAudioSourceRef.current?.disconnect();
-          remoteAnalyserRef.current?.disconnect();
-          remoteAudioSourceRef.current = null;
-          remoteAnalyserRef.current = null;
-        });
-        room.on(RoomEvent.Disconnected, () => {
-          if (roomRef.current !== room) return;
-          roomRef.current = null;
-          micTrackRef.current?.stop();
-          micTrackRef.current = null;
-          void closeAudioGraph();
-          talkingRef.current = false;
-          setTalking(false);
-          setRemoteSession(null);
-          setActiveDevice(null);
-          setNotice("媒体连接已断开，请重新连接设备");
-        });
-        await room.connect(result.session.media.url, result.session.media.token, { autoSubscribe: true });
-        await room.localParticipant.publishTrack(localMic, {
-          name: "phone-microphone",
-          source: Track.Source.Microphone,
-        });
-        roomRef.current = room;
-        micTrackRef.current = localMic;
-        await request(`/api/v1/sessions/${result.session.id}/media-ready`, { method: "POST", body: "{}" });
-      } else {
-        localMic.stop();
-      }
-      const poll = async () => {
-        const latest = await request<{ session: RemoteSession }>(`/api/v1/sessions/${result.session.id}`);
-        if (latest.session.status === "ready") {
-          if (pollRef.current) clearInterval(pollRef.current);
-          setRemoteSession(latest.session);
-          setActiveDevice(device);
-          setShowDevicePicker(false);
-          setConnectingId(null);
-        } else if (latest.session.status === "failed") {
-          if (pollRef.current) clearInterval(pollRef.current);
-          setConnectingId(null);
-          await disconnectMedia();
-          setNotice(sessionFailureMessages[latest.session.failureReason || ""] || "连接失败，请检查 Mac Bridge 的诊断信息");
-        }
-      };
-      await poll();
-      pollRef.current = setInterval(() => void poll().catch(() => null), 900);
+      await activateSession(result.session, device);
     } catch (error) {
       setConnectingId(null);
       await disconnectMedia();
@@ -402,25 +495,15 @@ export default function Home() {
     }
   }
 
-  async function setPtt(active: boolean) {
+  function setPtt(active: boolean) {
     if (!remoteSession || active === talkingRef.current) return;
+    armSessionIdleTimeout(remoteSession.id);
     talkingRef.current = active;
     setTalking(active);
-    pttQueueRef.current = pttQueueRef.current.then(async () => {
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 4_500);
-      try {
-        await request(`/api/v1/sessions/${remoteSession.id}/ptt`, {
-          method: "POST",
-          body: JSON.stringify({ active }),
-          keepalive: true,
-          signal: controller.signal,
-        });
-      } finally {
-        window.clearTimeout(timeout);
-      }
-    }).catch(() => setNotice("控制事件发送失败"));
-    await pttQueueRef.current;
+    const micTrack = micTrackRef.current;
+    if (micTrack) {
+      void (active ? micTrack.unmute() : micTrack.mute()).catch(() => setNotice("麦克风控制失败"));
+    }
   }
 
   function handlePointerDown(event: PointerEvent<HTMLButtonElement>) {
@@ -448,17 +531,58 @@ export default function Home() {
     const value = text.trim();
     if (!remoteSession || !value) return;
     setText("");
+    armSessionIdleTimeout(remoteSession.id);
     setMessages((current) => [...current, { side: "user", text: value }]);
-    try {
-      await request(`/api/v1/sessions/${remoteSession.id}/text`, {
-        method: "POST",
-        body: JSON.stringify({ text: value }),
-      });
+    if (sendSessionData({ type: "session.text", text: value })) {
       setMessages((current) => [...current, { side: "system", text: "已发送到 Mac Bridge" }]);
-    } catch {
+    } else {
       setMessages((current) => [...current, { side: "system", text: "发送失败，请重试" }]);
     }
   }
+
+  useEffect(() => {
+    let cancelled = false;
+    const initialize = async () => {
+      try {
+        const { user: current } = await request<{ user: AuthUser }>("/api/v1/auth/me");
+        if (cancelled) return;
+        setUser(current);
+      } catch {
+        if (!cancelled) {
+          setUser(null);
+          setLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const currentDevices = await loadDevices();
+        const { session } = await request<{ session: RemoteSession | null }>("/api/v1/sessions/active");
+        if (cancelled) return;
+        if (session) {
+          const device = currentDevices.find((candidate) => candidate.id === session.deviceId);
+          if (device) await activateSession(session, device);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          await disconnectMedia();
+          setConnectingId(null);
+          setShowDevicePicker(true);
+          setNotice((error as Error).message);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    void initialize();
+    return () => {
+      cancelled = true;
+      void disconnectMedia();
+    };
+    // Initialization intentionally runs once; session restoration owns the initial media connection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (loading) {
     return <main className="shell center"><LoaderCircle className="spin" aria-label="正在加载" /></main>;
