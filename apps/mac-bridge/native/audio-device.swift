@@ -10,7 +10,7 @@ enum AudioDeviceError: Error, CustomStringConvertible {
         switch self {
         case .property(let status): return "CoreAudio error \(status)"
         case .deviceNotFound(let name): return "Audio device not found: \(name)"
-        case .usage: return "Usage: audio-device get-defaults | set-defaults <input name-or-uid> <output name-or-uid>"
+        case .usage: return "Usage: audio-device get-input | set-input <input name-or-uid>"
         }
     }
 }
@@ -65,19 +65,16 @@ func setDefault(_ selector: AudioObjectPropertySelector, _ device: AudioDeviceID
 do {
     guard CommandLine.arguments.count >= 2 else { throw AudioDeviceError.usage }
     switch CommandLine.arguments[1] {
-    case "get-defaults":
+    case "get-input":
         let input = try defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
-        let output = try defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
         let result = [
             "inputUid": try stringProperty(input, kAudioDevicePropertyDeviceUID),
-            "outputUid": try stringProperty(output, kAudioDevicePropertyDeviceUID),
         ]
         let data = try JSONSerialization.data(withJSONObject: result, options: [])
         print(String(decoding: data, as: UTF8.self))
-    case "set-defaults":
-        guard CommandLine.arguments.count == 4 else { throw AudioDeviceError.usage }
+    case "set-input":
+        guard CommandLine.arguments.count == 3 else { throw AudioDeviceError.usage }
         try setDefault(kAudioHardwarePropertyDefaultInputDevice, findDevice(CommandLine.arguments[2]))
-        try setDefault(kAudioHardwarePropertyDefaultOutputDevice, findDevice(CommandLine.arguments[3]))
         print("ok")
     default:
         throw AudioDeviceError.usage

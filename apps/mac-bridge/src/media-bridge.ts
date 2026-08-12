@@ -23,6 +23,7 @@ const frameSamples = 480;
 const frameBytes = frameSamples * Int16Array.BYTES_PER_ELEMENT;
 
 type MediaCredentials = { url: string; token: string };
+type AudioDefaults = { inputUid: string };
 
 async function avFoundationAudioIndex(ffmpegPath: string, deviceName: string) {
   const result = await execFileAsync(ffmpegPath, ["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""], {
@@ -77,6 +78,7 @@ export class MacAudioBridge {
   private room: Room | null = null;
   private playout: ChildProcessWithoutNullStreams | null = null;
   private capture: ChildProcessWithoutNullStreams | null = null;
+  private appAudioDevice: ChildProcessWithoutNullStreams | null = null;
   private source: AudioSource | null = null;
   private localTrack: LocalAudioTrack | null = null;
   private captureQueue = Promise.resolve();
@@ -88,24 +90,77 @@ export class MacAudioBridge {
   private lastPhoneActivityAt = 0;
   private replyPeak = 0;
   private lastReplyActivityAt = 0;
-  private previousDefaults: { inputUid: string; outputUid: string } | null = null;
+  private previousDefaults: AudioDefaults | null = null;
 
-  private async setSessionAudioDefaults(input: string, output: string) {
+  private async prepareSessionAudioInput(input: string) {
     const script = resolve(dirname(fileURLToPath(import.meta.url)), "../native/audio-device.swift");
-    const { stdout } = await execFileAsync("/usr/bin/swift", [script, "get-defaults"]);
-    this.previousDefaults = JSON.parse(stdout) as { inputUid: string; outputUid: string };
-    await execFileAsync("/usr/bin/swift", [script, "set-defaults", input, output]);
+    const { stdout } = await execFileAsync("/usr/bin/swift", [script, "get-input"]);
+    this.previousDefaults = JSON.parse(stdout) as AudioDefaults;
+    await execFileAsync("/usr/bin/swift", [script, "set-input", input]);
+  }
+
+  private async startAppAudioDevice() {
+    const script = resolve(dirname(fileURLToPath(import.meta.url)), "../native/app-audio-device.swift");
+    const configuredBundleIds = process.env.CHATGPT_AUDIO_BUNDLE_IDS || "com.openai.codex,com.openai.codex.helper";
+    const bundleIds = configuredBundleIds.split(",").map((value) => value.trim()).filter(Boolean);
+    const child = spawn("/usr/bin/swift", [script, ...bundleIds], { stdio: ["pipe", "pipe", "pipe"] });
+    this.appAudioDevice = child;
+    const ready = await new Promise<{ deviceName: string; sampleRate: number; channels: number }>((resolveReady, rejectReady) => {
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        rejectReady(new Error("app_audio_device_timeout"));
+      }, 10_000);
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        stdout += chunk.toString();
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) return;
+        try {
+          const result = JSON.parse(stdout.slice(0, newline).trim()) as { deviceName: string; sampleRate: number; channels: number };
+          settled = true;
+          clearTimeout(timeout);
+          resolveReady(result);
+        } catch (error) {
+          settled = true;
+          clearTimeout(timeout);
+          rejectReady(error);
+        }
+      });
+      child.once("exit", (code, signal) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        rejectReady(new Error(stderr.trim() || `app_audio_device_exited:${code ?? signal}`));
+      });
+    }).catch(async (error) => {
+      await stopChild(child);
+      this.appAudioDevice = null;
+      throw error;
+    });
+    if (ready.sampleRate !== sampleRate || ready.channels !== channels) {
+      await stopChild(child);
+      this.appAudioDevice = null;
+      throw new Error(`unsupported_app_audio_format:${ready.sampleRate}/${ready.channels}`);
+    }
+    waitForExit(child, "Codex app audio device");
+    console.log("✓ Codex 应用回传音频捕获已就绪");
+    return ready.deviceName;
   }
 
   async connect(credentials: MediaCredentials) {
     const ffmpegPath = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
     const phoneToChatGptDevice = process.env.PHONE_TO_CHATGPT_DEVICE || "BlackHole 2ch";
-    const chatGptToPhoneDevice = process.env.CHATGPT_TO_PHONE_DEVICE || "BlackHole 16ch";
-    const [playoutIndex, captureIndex] = await Promise.all([
-      audioToolboxOutputIndex(ffmpegPath, phoneToChatGptDevice),
-      avFoundationAudioIndex(ffmpegPath, chatGptToPhoneDevice),
-    ]);
-    await this.setSessionAudioDefaults(phoneToChatGptDevice, chatGptToPhoneDevice);
+    const playoutIndex = await audioToolboxOutputIndex(ffmpegPath, phoneToChatGptDevice);
+    await this.prepareSessionAudioInput(phoneToChatGptDevice);
+    const appAudioDeviceName = await this.startAppAudioDevice();
+    const captureIndex = await avFoundationAudioIndex(ffmpegPath, appAudioDeviceName);
 
     this.playout = spawn(ffmpegPath, [
       "-hide_banner", "-loglevel", "error",
@@ -150,13 +205,12 @@ export class MacAudioBridge {
     this.capture = spawn(ffmpegPath, [
       "-hide_banner", "-loglevel", "error", "-thread_queue_size", "512",
       "-f", "avfoundation", "-i", `:${captureIndex}`,
-      "-af", "pan=mono|c0=c0+c1+c2+c3+c4+c5+c6+c7+c8+c9+c10+c11+c12+c13+c14+c15",
       "-ac", String(channels), "-ar", String(sampleRate), "-f", "s16le", "pipe:1",
     ], { stdio: ["pipe", "pipe", "pipe"] });
-    waitForExit(this.capture, "BlackHole capture");
+    waitForExit(this.capture, "Codex audio capture");
     this.capture.stderr.on("data", (chunk: Buffer) => {
       const message = chunk.toString().trim();
-      if (message && !this.closed) console.error(`BlackHole capture: ${message}`);
+      if (message && !this.closed) console.error(`Codex audio capture: ${message}`);
     });
     this.capture.stdout.on("data", (chunk: Buffer) => this.enqueueCapturedAudio(chunk));
     await remoteTrackReady;
@@ -224,15 +278,16 @@ export class MacAudioBridge {
     await this.remoteStream?.cancel().catch(() => null);
     this.remoteStream = null;
     this.remoteTrackSid = null;
-    await Promise.all([stopChild(this.playout), stopChild(this.capture)]);
+    await Promise.all([stopChild(this.playout), stopChild(this.capture), stopChild(this.appAudioDevice)]);
     this.playout = null;
     this.capture = null;
+    this.appAudioDevice = null;
     await this.localTrack?.close().catch(() => null);
     await this.source?.close().catch(() => null);
     await this.room?.disconnect();
     if (this.previousDefaults) {
       const script = resolve(dirname(fileURLToPath(import.meta.url)), "../native/audio-device.swift");
-      await execFileAsync("/usr/bin/swift", [script, "set-defaults", this.previousDefaults.inputUid, this.previousDefaults.outputUid]).catch((error) => {
+      await execFileAsync("/usr/bin/swift", [script, "set-input", this.previousDefaults.inputUid]).catch((error) => {
         console.error(`Unable to restore Mac audio defaults: ${(error as Error).message}`);
       });
       this.previousDefaults = null;
