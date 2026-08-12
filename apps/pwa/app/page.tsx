@@ -127,6 +127,7 @@ export default function Home() {
   const controlHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sessionIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const contentListRef = useRef<HTMLDivElement | null>(null);
+  const voiceControlsRef = useRef<HTMLDivElement | null>(null);
   const historyCursorRef = useRef<string | null | undefined>(undefined);
   const historyLoadingRef = useRef(false);
   const mediaConnectionAttemptRef = useRef(0);
@@ -223,6 +224,31 @@ export default function Home() {
       audioElement.pause();
       audioElement.srcObject = null;
       audioElement.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    const isInsideVoiceControls = (node: Node | null) => Boolean(node && voiceControlsRef.current?.contains(node));
+    const preventVoiceSelection = (event: Event) => {
+      if (!isInsideVoiceControls(event.target as Node | null)) return;
+      event.preventDefault();
+      window.getSelection()?.removeAllRanges();
+    };
+    const clearVoiceSelection = () => {
+      const selection = window.getSelection();
+      if (isInsideVoiceControls(selection?.anchorNode ?? null) || isInsideVoiceControls(selection?.focusNode ?? null)) {
+        selection?.removeAllRanges();
+      }
+    };
+    document.addEventListener("selectstart", preventVoiceSelection, true);
+    document.addEventListener("contextmenu", preventVoiceSelection, true);
+    document.addEventListener("dragstart", preventVoiceSelection, true);
+    document.addEventListener("selectionchange", clearVoiceSelection);
+    return () => {
+      document.removeEventListener("selectstart", preventVoiceSelection, true);
+      document.removeEventListener("contextmenu", preventVoiceSelection, true);
+      document.removeEventListener("dragstart", preventVoiceSelection, true);
+      document.removeEventListener("selectionchange", clearVoiceSelection);
     };
   }, []);
 
@@ -748,7 +774,7 @@ export default function Home() {
               </article>
             ))}
           </div>
-          <div className="voice-controls">
+          <div className="voice-controls" ref={voiceControlsRef}>
             <p className="voice-status">{talking ? "正在发送" : replyActive ? "GPT 正在回复" : "按住说话"}</p>
             <div className={`voice-dots ${talking || replyActive ? "active" : ""}`} aria-hidden>
               {waveLevels.map((level, index) => <i key={index} style={{ height: `${8 + level * 28}px` }} />)}
@@ -756,7 +782,6 @@ export default function Home() {
             <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onLostPointerCapture={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
               <Mic />
             </button>
-            <p className="helper">松开发送</p>
           </div>
         </section>
         {notice && <p className="notice error">{notice}</p>}

@@ -93,7 +93,7 @@ function mediaKind(path: string): SessionContent["kind"] {
   return "file";
 }
 
-function agentMessageContent(item: ThreadItem): Array<Omit<SessionContent, "order">> {
+function agentMediaContent(item: ThreadItem): Array<Omit<SessionContent, "order">> {
   const id = String(item.id || "agent");
   const source = typeof item.text === "string" ? item.text : "";
   const content: Array<Omit<SessionContent, "order">> = [];
@@ -108,11 +108,108 @@ function agentMessageContent(item: ThreadItem): Array<Omit<SessionContent, "orde
       content.push({ id: `${id}:media:${mediaIndex++}`, role: "assistant", kind, label });
     }
   }
-  const text = source
-    .replace(/::[a-z0-9-]+(?:\{[^}]*})?/gi, "")
-    .replace(mediaPattern, "")
+  return content;
+}
+
+type TranscriptLine = { role: "user" | "assistant"; text: string };
+type RealtimeDelegation = { id: string; input: string | null; source: string | null; transcript: TranscriptLine[] };
+
+function realtimeDelegation(item: ThreadItem): RealtimeDelegation | null {
+  if (item.type !== "userMessage") return null;
+  const blocks = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
+  const source = blocks
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .find((text) => text.includes("<realtime_delegation>"));
+  if (!source) return null;
+  const transcript = (extractTag(source, "transcript_delta") || "")
+    .split(/\r?\n/)
+    .flatMap((line): TranscriptLine[] => {
+      const match = line.match(/^\s*(user|assistant)\s*:\s*(.+?)\s*$/i);
+      if (!match?.[2]?.trim()) return [];
+      return [{ role: match[1].toLowerCase() === "assistant" ? "assistant" : "user", text: match[2].trim() }];
+    });
+  return {
+    id: String(item.id || crypto.randomUUID()),
+    input: extractTag(source, "input"),
+    source: extractTag(source, "source"),
+    transcript,
+  };
+}
+
+function normalizedSpeech(value: string) {
+  return value.toLocaleLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function sameSpeech(left: string, right: string) {
+  const normalizedLeft = normalizedSpeech(left);
+  const normalizedRight = normalizedSpeech(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight) return true;
+  return Math.min(normalizedLeft.length, normalizedRight.length) >= 4
+    && (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft));
+}
+
+function finalAssistantText(lines: TranscriptLine[]) {
+  const assistantLines = lines.filter((line) => line.role === "assistant");
+  return assistantLines
+    .filter((line, index) => !assistantLines.slice(index + 1).some((later) => sameSpeech(line.text, later.text)))
+    .map((line) => line.text)
+    .join(" ")
     .trim();
-  if (text) content.unshift({ id: `${id}:text`, role: "assistant", kind: "text", text });
+}
+
+function findLastLineIndex(lines: TranscriptLine[], predicate: (line: TranscriptLine, index: number) => boolean) {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (predicate(lines[index], index)) return index;
+  }
+  return -1;
+}
+
+function threadVisibleContent(thread: ThreadDetail): Array<Omit<SessionContent, "order">> {
+  const content: Array<Omit<SessionContent, "order">> = [];
+  let previousInput: string | null = null;
+  for (const turn of thread.turns || []) {
+    for (const item of turn.items || []) {
+      const delegation = realtimeDelegation(item);
+      if (!delegation) {
+        content.push(...visibleContent(item));
+        continue;
+      }
+
+      if (previousInput) {
+        const currentIsNew = Boolean(delegation.input && delegation.source !== "transcript_tail_flush" && !sameSpeech(delegation.input, previousInput));
+        const currentBoundary = currentIsNew
+          ? findLastLineIndex(delegation.transcript, (line) => line.role === "user" && sameSpeech(line.text, delegation.input!))
+          : delegation.transcript.length;
+        const boundary = currentBoundary >= 0 ? currentBoundary : delegation.transcript.length;
+        const previousIndex = findLastLineIndex(delegation.transcript, (line, index) => (
+          index < boundary && line.role === "user" && sameSpeech(line.text, previousInput!)
+        ));
+        if (previousIndex >= 0) {
+          const assistantText = finalAssistantText(delegation.transcript.slice(previousIndex + 1, boundary));
+          if (assistantText) {
+            content.push({
+              id: `${delegation.id}:transcript:assistant`,
+              role: "assistant",
+              kind: "text",
+              text: assistantText,
+            });
+          }
+        }
+      }
+
+      if (delegation.input && delegation.source !== "transcript_tail_flush" && (!previousInput || !sameSpeech(delegation.input, previousInput))) {
+        content.push({
+          id: `${delegation.id}:transcript:user`,
+          role: "user",
+          kind: "text",
+          text: delegation.input,
+        });
+        previousInput = delegation.input;
+      }
+    }
+  }
   return content;
 }
 
@@ -131,7 +228,7 @@ function visibleContent(item: ThreadItem): Array<Omit<SessionContent, "order">> 
     });
     return content;
   }
-  if (item.type === "agentMessage") return agentMessageContent(item);
+  if (item.type === "agentMessage") return agentMediaContent(item);
   if (item.type === "imageGeneration") {
     return [{ id, role: "assistant", kind: "image", label: "暂不支持此内容" }];
   }
@@ -204,8 +301,7 @@ export class CodexSessionContentMonitor {
       this.selectedThreadId = threadId;
       console.log(`✓ 正在同步 GPT-Live 会话内容 (${threadId.slice(0, 8)})`);
     }
-    const contents = (thread.turns || [])
-      .flatMap((turn) => (turn.items || []).flatMap(visibleContent))
+    const contents = threadVisibleContent(thread)
       .map((content, order) => ({ ...content, order }));
     this.allContent = contents;
     for (const content of contents) {
