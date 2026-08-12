@@ -92,6 +92,18 @@ db.exec(`
     FOREIGN KEY(device_id) REFERENCES devices(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
   );
+  CREATE TABLE IF NOT EXISTS session_content (
+    session_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT,
+    label TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(session_id, id),
+    FOREIGN KEY(session_id) REFERENCES remote_sessions(id)
+  );
 `);
 try {
   db.exec("ALTER TABLE remote_sessions ADD COLUMN failure_reason TEXT");
@@ -105,6 +117,14 @@ try {
 }
 
 type User = { id: string; email: string };
+type SessionContent = {
+  id: string;
+  order: number;
+  role: "user" | "assistant";
+  kind: "text" | "image" | "video" | "audio" | "file" | "unsupported";
+  text?: string;
+  label?: string;
+};
 type BridgeMessage =
   | { type: "bridge.heartbeat" }
   | { type: "pairing.approve"; requestId: string }
@@ -112,10 +132,12 @@ type BridgeMessage =
   | { type: "session.ready"; sessionId: string }
   | { type: "session.failed"; sessionId: string; reason?: string }
   | { type: "session.stopped"; sessionId: string }
-  | { type: "session.stop_failed"; sessionId: string; reason?: string };
+  | { type: "session.stop_failed"; sessionId: string; reason?: string }
+  | { type: "session.content"; sessionId: string; content: SessionContent }
+  | { type: "session.content.history"; sessionId: string; items: SessionContent[]; nextCursor: string | null };
 type PhoneControlMessage =
   | { type: "control.heartbeat" }
-  | { type: "session.text"; text: string };
+  | { type: "session.content.history.request"; before?: string | null; limit?: number };
 
 const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie"] } });
 await app.register(cookie);
@@ -123,6 +145,7 @@ await app.register(rateLimit, { global: false });
 await app.register(websocket);
 
 const bridgeSockets = new Map<string, WebSocket>();
+const phoneSessionSockets = new Map<string, Set<WebSocket>>();
 const now = () => Date.now();
 const hmac = (value: string) => createHmac("sha256", env.COOKIE_SECRET).update(value).digest("hex");
 const randomToken = (bytes = 32) => randomBytes(bytes).toString("base64url");
@@ -136,6 +159,36 @@ const maskedEmail = (email: string) => {
   const [name, domain] = email.split("@");
   return `${name.slice(0, 1)}***@${domain}`;
 };
+
+function broadcastToSession(sessionId: string, message: Record<string, unknown>) {
+  const payload = JSON.stringify({ sessionId, ...message });
+  for (const socket of phoneSessionSockets.get(sessionId) || []) {
+    if (socket.readyState === 1) socket.send(payload);
+  }
+}
+
+const sessionContentSchema = z.object({
+  id: z.string().min(1).max(200),
+  order: z.number().int().nonnegative(),
+  role: z.enum(["user", "assistant"]),
+  kind: z.enum(["text", "image", "video", "audio", "file", "unsupported"]),
+  text: z.string().max(20_000).optional(),
+  label: z.string().max(500).optional(),
+});
+
+function storeContent(sessionId: string, content: SessionContent) {
+  db.prepare(`
+    INSERT INTO session_content(session_id, id, position, role, kind, text, label, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(session_id, id) DO UPDATE SET
+      position = excluded.position,
+      role = excluded.role,
+      kind = excluded.kind,
+      text = excluded.text,
+      label = excluded.label,
+      updated_at = excluded.updated_at
+  `).run(sessionId, content.id, content.order, content.role, content.kind, content.text || null, content.label || null, now());
+}
 
 async function liveKitToken(room: string, identity: string) {
   if (!liveKitConfigured) return null;
@@ -322,6 +375,36 @@ app.get("/api/v1/bridge/ws", { websocket: true }, (socket, request) => {
             message.sessionId,
             device.id,
           );
+      } else if (message.type === "session.content") {
+        const parsed = z.object({
+          type: z.literal("session.content"),
+          sessionId: z.string().uuid(),
+          content: sessionContentSchema,
+        }).safeParse(message);
+        if (!parsed.success) return;
+        const active = db.prepare("SELECT id FROM remote_sessions WHERE id = ? AND device_id = ? AND status IN ('starting', 'ready')")
+          .get(parsed.data.sessionId, device.id);
+        if (!active) return;
+        storeContent(parsed.data.sessionId, parsed.data.content);
+        broadcastToSession(parsed.data.sessionId, { type: "session.content", content: parsed.data.content });
+      } else if (message.type === "session.content.history") {
+        const parsed = z.object({
+          type: z.literal("session.content.history"),
+          sessionId: z.string().uuid(),
+          items: z.array(sessionContentSchema).max(50),
+          nextCursor: z.string().max(50).nullable(),
+        }).safeParse(message);
+        if (!parsed.success) return;
+        const active = db.prepare("SELECT id FROM remote_sessions WHERE id = ? AND device_id = ? AND status IN ('starting', 'ready')")
+          .get(parsed.data.sessionId, device.id);
+        if (!active) return;
+        const storePage = db.transaction((items: SessionContent[]) => items.forEach((content) => storeContent(parsed.data.sessionId, content)));
+        storePage(parsed.data.items);
+        broadcastToSession(parsed.data.sessionId, {
+          type: "session.content.history",
+          items: parsed.data.items,
+          nextCursor: parsed.data.nextCursor,
+        });
       }
     } catch (error) {
       request.log.warn({ error }, "invalid bridge message");
@@ -465,27 +548,49 @@ app.get("/api/v1/sessions/:id/ws", { websocket: true }, (socket, request) => {
     .get(id.data, user.id) as { id: string; device_id: string } | undefined;
   if (!session) return socket.close(1008, "invalid session");
 
+  const sessionSockets = phoneSessionSockets.get(session.id) || new Set<WebSocket>();
+  sessionSockets.add(socket);
+  phoneSessionSockets.set(session.id, sessionSockets);
   socket.send(JSON.stringify({ type: "control.ready", sessionId: session.id }));
+  const recentContent = db.prepare(`
+    SELECT id, position as "order", role, kind, text, label
+    FROM session_content
+    WHERE session_id = ?
+    ORDER BY position DESC
+    LIMIT 20
+  `).all(session.id) as SessionContent[];
+  socket.send(JSON.stringify({
+    type: "session.content.snapshot",
+    sessionId: session.id,
+    items: recentContent.reverse(),
+    nextCursor: recentContent.length === 20 ? String(recentContent[0].order) : null,
+  }));
   socket.on("message", (data: RawData) => {
     try {
       const parsed = z.discriminatedUnion("type", [
         z.object({ type: z.literal("control.heartbeat") }),
-        z.object({ type: z.literal("session.text"), text: z.string().trim().min(1).max(2000) }),
+        z.object({
+          type: z.literal("session.content.history.request"),
+          before: z.string().max(50).nullable().optional(),
+          limit: z.number().int().min(1).max(50).optional(),
+        }),
       ]).safeParse(JSON.parse(String(data)));
       if (!parsed.success) return socket.send(JSON.stringify({ type: "control.error", error: "invalid_message" }));
       const message = parsed.data as PhoneControlMessage;
       if (message.type === "control.heartbeat") {
         return socket.send(JSON.stringify({ type: "control.heartbeat.ack", at: now() }));
       }
-      const latest = db.prepare("SELECT status FROM remote_sessions WHERE id = ?").get(session.id) as { status: string } | undefined;
-      if (latest?.status !== "ready") return socket.send(JSON.stringify({ type: "control.error", error: "session_not_ready" }));
       const bridge = bridgeSockets.get(session.device_id);
-      if (!bridge || bridge.readyState !== bridge.OPEN) return socket.send(JSON.stringify({ type: "control.error", error: "bridge_offline" }));
+      if (!bridge || bridge.readyState !== 1) return socket.send(JSON.stringify({ type: "control.error", error: "bridge_offline" }));
       bridge.send(JSON.stringify({ sessionId: session.id, ...message }));
     } catch (error) {
       request.log.warn({ error, sessionId: session.id }, "invalid phone control message");
       socket.send(JSON.stringify({ type: "control.error", error: "invalid_message" }));
     }
+  });
+  socket.on("close", () => {
+    sessionSockets.delete(socket);
+    if (sessionSockets.size === 0) phoneSessionSockets.delete(session.id);
   });
 });
 

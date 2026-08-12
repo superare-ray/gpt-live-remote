@@ -2,8 +2,6 @@
 
 import {
   ArrowLeft,
-  ArrowUp,
-  Check,
   ChevronDown,
   Laptop,
   LoaderCircle,
@@ -14,7 +12,6 @@ import {
   RefreshCw,
   Server,
   Square,
-  Type,
   Volume2,
   Waves,
 } from "lucide-react";
@@ -36,7 +33,14 @@ type RemoteSession = {
   failureReason?: string | null;
   media?: { url: string; token: string } | null;
 };
-type Mode = "voice" | "text";
+type ContentEntry = {
+  id: string;
+  order: number;
+  role: "user" | "assistant";
+  kind: "text" | "image" | "video" | "audio" | "file" | "unsupported";
+  text?: string;
+  label?: string;
+};
 type WaveLevels = [number, number, number];
 const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
 const sessionFailureMessages: Record<string, string> = {
@@ -78,10 +82,9 @@ export default function Home() {
   const [activeDevice, setActiveDevice] = useState<Device | null>(null);
   const [remoteSession, setRemoteSession] = useState<RemoteSession | null>(null);
   const [showDevicePicker, setShowDevicePicker] = useState(false);
-  const [mode, setMode] = useState<Mode>("voice");
   const [talking, setTalking] = useState(false);
-  const [text, setText] = useState("");
-  const [messages, setMessages] = useState<Array<{ side: "user" | "system"; text: string }>>([]);
+  const [contentItems, setContentItems] = useState<ContentEntry[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const roomRef = useRef<Room | null>(null);
@@ -98,7 +101,35 @@ export default function Home() {
   const controlSessionRef = useRef<string | null>(null);
   const controlHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sessionIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contentListRef = useRef<HTMLDivElement | null>(null);
+  const historyCursorRef = useRef<string | null | undefined>(undefined);
+  const historyLoadingRef = useRef(false);
   const [waveLevels, setWaveLevels] = useState<WaveLevels>([0, 0, 0]);
+
+  const mergeContent = useCallback((items: ContentEntry[], prepend = false) => {
+    const list = contentListRef.current;
+    const previousHeight = list?.scrollHeight || 0;
+    const wasNearBottom = !list || list.scrollHeight - list.scrollTop - list.clientHeight < 96;
+    setContentItems((current) => {
+      const byId = new Map(current.map((entry) => [entry.id, entry]));
+      items.forEach((entry) => byId.set(entry.id, entry));
+      return [...byId.values()].sort((left, right) => left.order - right.order);
+    });
+    requestAnimationFrame(() => {
+      if (!list) return;
+      if (prepend) list.scrollTop += list.scrollHeight - previousHeight;
+      else if (wasNearBottom) list.scrollTop = list.scrollHeight;
+    });
+  }, []);
+
+  const requestOlderContent = useCallback(() => {
+    const socket = controlSocketRef.current;
+    const before = historyCursorRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN || before == null || historyLoadingRef.current) return;
+    historyLoadingRef.current = true;
+    setHistoryLoading(true);
+    socket.send(JSON.stringify({ type: "session.content.history.request", before, limit: 20 }));
+  }, []);
 
   const closeSessionControl = useCallback(() => {
     controlSessionRef.current = null;
@@ -246,8 +277,25 @@ export default function Home() {
       };
       socket.onmessage = (event) => {
         try {
-          const message = JSON.parse(String(event.data)) as { type?: string; error?: string };
+          const message = JSON.parse(String(event.data)) as {
+            type?: string;
+            error?: string;
+            content?: ContentEntry;
+            items?: ContentEntry[];
+            nextCursor?: string | null;
+          };
           if (message.type === "control.error" && message.error === "bridge_offline") setNotice("Mac Bridge 已离线");
+          if (message.type === "session.content.snapshot" && Array.isArray(message.items)) {
+            mergeContent(message.items);
+            if ("nextCursor" in message) historyCursorRef.current = message.nextCursor;
+          } else if (message.type === "session.content.history" && Array.isArray(message.items)) {
+            mergeContent(message.items, historyCursorRef.current !== undefined);
+            historyCursorRef.current = message.nextCursor ?? null;
+            historyLoadingRef.current = false;
+            setHistoryLoading(false);
+          } else if (message.type === "session.content" && message.content) {
+            mergeContent([message.content]);
+          }
         } catch {
           // Ignore unknown status messages; the socket remains usable.
         }
@@ -289,13 +337,6 @@ export default function Home() {
         });
       });
     }, 10 * 60_000);
-  }
-
-  function sendSessionData(message: { type: "session.text"; text: string }) {
-    const socket = controlSocketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify(message));
-    return true;
   }
 
   async function sendLoginCode(event: FormEvent) {
@@ -474,6 +515,8 @@ export default function Home() {
   async function connectDevice(device: Device) {
     setConnectingId(device.id);
     setNotice(null);
+    setContentItems([]);
+    historyCursorRef.current = undefined;
     if (remoteSession) {
       try {
         await stopCurrentSession(true);
@@ -524,20 +567,6 @@ export default function Home() {
     if (event && activePointerRef.current !== null && event.pointerId !== activePointerRef.current) return;
     activePointerRef.current = null;
     void setPtt(false);
-  }
-
-  async function sendText(event: FormEvent) {
-    event.preventDefault();
-    const value = text.trim();
-    if (!remoteSession || !value) return;
-    setText("");
-    armSessionIdleTimeout(remoteSession.id);
-    setMessages((current) => [...current, { side: "user", text: value }]);
-    if (sendSessionData({ type: "session.text", text: value })) {
-      setMessages((current) => [...current, { side: "system", text: "已发送到 Mac Bridge" }]);
-    } else {
-      setMessages((current) => [...current, { side: "system", text: "发送失败，请重试" }]);
-    }
   }
 
   useEffect(() => {
@@ -628,35 +657,40 @@ export default function Home() {
           </button>
           <div className="session-actions">
             <button className="icon-button" type="button" onClick={() => { void audioContextRef.current?.resume(); void remoteAudioElementRef.current?.play().catch(() => null); }} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
-            <button className="icon-button" type="button" onClick={() => setMode(mode === "voice" ? "text" : "voice")} aria-label={mode === "voice" ? "切换到文字" : "切换到语音"} title={mode === "voice" ? "切换到文字" : "切换到语音"}>
-              {mode === "voice" ? <Type /> : <Waves />}
-            </button>
           </div>
         </header>
         <p className="connection-line"><span className="online-dot" /> 已连接 · 控制通道正常</p>
-        {mode === "voice" ? (
-          <section className="voice-stage">
+        <section className="voice-stage">
+          <div
+            className="transcript-list"
+            ref={contentListRef}
+            aria-live="polite"
+            aria-label="对话记录"
+            onScroll={(event) => {
+              if (event.currentTarget.scrollTop < 72) requestOlderContent();
+            }}
+          >
+            {historyLoading && <p className="history-loading"><LoaderCircle className="spin" /> 正在加载更早内容</p>}
+            {contentItems.length === 0 && <p className="transcript-empty">开始说话后，对话文字会显示在这里</p>}
+            {contentItems.map((entry) => (
+              <article className={`bubble ${entry.role}`} key={entry.id}>
+                {entry.kind === "text" && entry.text
+                  ? entry.text
+                  : <span className="unsupported-content">暂不支持此内容</span>}
+              </article>
+            ))}
+          </div>
+          <div className="voice-controls">
             <p className="voice-status">{talking ? "正在发送" : replyActive ? "GPT 正在回复" : "按住说话"}</p>
             <div className={`voice-dots ${talking || replyActive ? "active" : ""}`} aria-hidden>
-              {waveLevels.map((level, index) => <i key={index} style={{ height: `${10 + level * 54}px` }} />)}
+              {waveLevels.map((level, index) => <i key={index} style={{ height: `${8 + level * 28}px` }} />)}
             </div>
             <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onLostPointerCapture={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
               <Mic />
             </button>
             <p className="helper">松开发送</p>
-          </section>
-        ) : (
-          <section className="text-stage">
-            <div className="messages">
-              <p className="system-message"><Check /> 已连接 Mac Bridge</p>
-              {messages.map((message, index) => <p className={`bubble ${message.side}`} key={`${message.text}-${index}`}>{message.text}</p>)}
-            </div>
-            <form className="composer" onSubmit={sendText}>
-              <input value={text} onChange={(event) => setText(event.target.value)} placeholder="输入消息…" aria-label="输入消息" />
-              <button type="submit" aria-label="发送"><ArrowUp /></button>
-            </form>
-          </section>
-        )}
+          </div>
+        </section>
         {notice && <p className="notice error">{notice}</p>}
       </main>
     );

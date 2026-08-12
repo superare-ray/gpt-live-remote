@@ -7,6 +7,7 @@ import qrcode from "qrcode-terminal";
 import WebSocket from "ws";
 import { desktopVoiceConfigFromEnv, startAndVerifyVoice, stopAndVerifyVoice } from "./desktop-voice.js";
 import { MacAudioBridge } from "./media-bridge.js";
+import { CodexSessionContentMonitor } from "./session-content.js";
 
 type DeviceConfig = { id: string; name: string; kind: "macbook" | "macmini"; secret: string };
 type ServerMessage =
@@ -15,7 +16,7 @@ type ServerMessage =
   | { type: "pairing.request"; requestId: string; email: string; confirmationCode: string }
   | { type: "session.start"; sessionId: string; media?: { url: string; token: string } | null }
   | { type: "session.stop"; sessionId: string }
-  | { type: "session.text"; sessionId: string; text: string };
+  | { type: "session.content.history.request"; sessionId: string; before?: string | null; limit?: number };
 
 const apiBase = process.env.CONTROL_API_BASE?.replace(/\/$/, "");
 if (!apiBase) throw new Error("CONTROL_API_BASE is required");
@@ -80,6 +81,7 @@ const socket = new WebSocket(wsUrl, {
 });
 let heartbeat: NodeJS.Timeout | null = null;
 let activeMedia: MacAudioBridge | null = null;
+let activeContentMonitor: CodexSessionContentMonitor | null = null;
 let activeSessionId: string | null = null;
 
 socket.on("open", async () => {
@@ -108,6 +110,21 @@ socket.on("message", async (raw) => {
     try {
       if (!message.media?.url || !message.media.token) throw new Error("media_credentials_missing");
       await activeMedia?.close();
+      await activeContentMonitor?.close();
+      activeContentMonitor = new CodexSessionContentMonitor((content) => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify({
+          type: "session.content",
+          sessionId: message.sessionId,
+          content,
+        }));
+      });
+      await activeContentMonitor.start();
+      socket.send(JSON.stringify({
+        type: "session.content.history",
+        sessionId: message.sessionId,
+        ...activeContentMonitor.history(null, 20),
+      }));
       activeMedia = new MacAudioBridge();
       await activeMedia.connect(message.media);
       console.log("✓ 双向 WebRTC 与 BlackHole 音频链路已就绪");
@@ -127,8 +144,18 @@ socket.on("message", async (raw) => {
       console.error(`✗ ChatGPT Voice 启动未确认：${reason}\n`);
       await activeMedia?.close();
       activeMedia = null;
+      await activeContentMonitor?.close();
+      activeContentMonitor = null;
       activeSessionId = null;
       socket.send(JSON.stringify({ type: "session.failed", sessionId: message.sessionId, reason }));
+    }
+  } else if (message.type === "session.content.history.request") {
+    if (activeSessionId === message.sessionId && activeContentMonitor && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        type: "session.content.history",
+        sessionId: message.sessionId,
+        ...activeContentMonitor.history(message.before, message.limit),
+      }));
     }
   } else if (message.type === "session.stop") {
     if (activeSessionId && activeSessionId !== message.sessionId) {
@@ -139,6 +166,8 @@ socket.on("message", async (raw) => {
     try {
       await activeMedia?.close();
       activeMedia = null;
+      await activeContentMonitor?.close();
+      activeContentMonitor = null;
       if (process.env.MEDIA_ONLY_MODE !== "true") {
         await stopAndVerifyVoice(desktopVoiceConfigFromEnv());
       }
@@ -150,8 +179,6 @@ socket.on("message", async (raw) => {
       console.error(`✗ GPT Voice 关闭未确认：${reason}\n`);
       socket.send(JSON.stringify({ type: "session.stop_failed", sessionId: message.sessionId, reason }));
     }
-  } else if (message.type === "session.text") {
-    console.log(`✉ 手机文字：${message.text}`);
   }
 });
 
@@ -165,6 +192,7 @@ socket.on("close", (code, reason) => {
 socket.on("error", (error) => console.error(`连接错误：${error.message}`));
 process.on("SIGINT", () => {
   void activeMedia?.close();
+  void activeContentMonitor?.close();
   socket.close(1000, "user exit");
   readline.close();
 });
