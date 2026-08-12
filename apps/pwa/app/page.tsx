@@ -30,9 +30,10 @@ type Device = {
 };
 type RemoteSession = { id: string; deviceId: string; status: "starting" | "ready" | "failed" };
 type Mode = "voice" | "text";
+const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(`${appBasePath}${path}`, {
     ...init,
     credentials: "include",
     headers: { "content-type": "application/json", ...(init?.headers || {}) },

@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
+const basePath = process.env.APP_BASE_PATH ?? "";
+
 const geistSans = Geist({
   variable: "--font-geist-sans",
   subsets: ["latin"],
@@ -17,19 +19,19 @@ export const metadata: Metadata = {
   title: "GPT-Live Remote",
   description: "从手机安全连接 Mac 上的 GPT-Live",
   applicationName: "GPT-Live Remote",
-  manifest: "/manifest.webmanifest",
-  icons: { icon: "/icon.svg" },
+  manifest: `${basePath}/manifest.webmanifest`,
+  icons: { icon: `${basePath}/icon.svg` },
   openGraph: {
     title: "GPT-Live Remote",
     description: "从手机安全连接 Mac 上的 GPT-Live",
     type: "website",
-    images: [{ url: "/og.png", width: 1200, height: 630, alt: "GPT-Live Remote" }],
+    images: [{ url: `${basePath}/og.png`, width: 1200, height: 630, alt: "GPT-Live Remote" }],
   },
   twitter: {
     card: "summary_large_image",
     title: "GPT-Live Remote",
     description: "从手机安全连接 Mac 上的 GPT-Live",
-    images: ["/og.png"],
+    images: [`${basePath}/og.png`],
   },
   appleWebApp: {
     capable: true,
