@@ -160,6 +160,12 @@ export default function Home() {
     socket.send(JSON.stringify({ type: "session.content.history.request", before, limit: 20 }));
   }, []);
 
+  const reportClientMedia = useCallback((stage: "track_subscribed" | "track_unsubscribed" | "playback_ready" | "playback_blocked" | "playback_error", detail?: string) => {
+    const socket = controlSocketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "client.media.status", stage, detail }));
+  }, []);
+
   const closeSessionControl = useCallback(() => {
     controlSessionRef.current = null;
     if (controlHeartbeatRef.current) clearInterval(controlHeartbeatRef.current);
@@ -220,8 +226,14 @@ export default function Home() {
     audioElement.playsInline = true;
     audioElement.preload = "auto";
     audioElement.style.display = "none";
-    const handlePlaying = () => setAudioPlaybackStatus("ready");
-    const handleError = () => setAudioPlaybackStatus("error");
+    const handlePlaying = () => {
+      setAudioPlaybackStatus("ready");
+      reportClientMedia("playback_ready", "audio_element_playing");
+    };
+    const handleError = () => {
+      setAudioPlaybackStatus("error");
+      reportClientMedia("playback_error", `media_error_${audioElement.error?.code || "unknown"}`);
+    };
     audioElement.addEventListener("playing", handlePlaying);
     audioElement.addEventListener("error", handleError);
     document.body.appendChild(audioElement);
@@ -234,7 +246,7 @@ export default function Home() {
       audioElement.removeEventListener("error", handleError);
       audioElement.remove();
     };
-  }, []);
+  }, [reportClientMedia]);
 
   useEffect(() => {
     const isInsideVoiceControls = (node: Node | null) => Boolean(node && voiceControlsRef.current?.contains(node));
@@ -505,9 +517,10 @@ export default function Home() {
       ensureCurrentAttempt();
       const room = new Room({ adaptiveStream: false, dynacast: false });
       roomRef.current = room;
-      room.on(RoomEvent.TrackSubscribed, (track) => {
+      room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
         if (track.kind !== Track.Kind.Audio) return;
         setAudioPlaybackStatus("waiting");
+        reportClientMedia("track_subscribed", `${participant.identity}:${publication.trackSid}`);
         const audioElement = remoteAudioElementRef.current;
         if (audioElement) {
           track.attach(audioElement);
@@ -515,8 +528,15 @@ export default function Home() {
           audioElement.volume = 1;
           void room.startAudio()
             .then(() => audioElement.play())
-            .then(() => setAudioPlaybackStatus("ready"))
-            .catch((error: Error) => setAudioPlaybackStatus(error.name === "NotAllowedError" ? "blocked" : "error"));
+            .then(() => {
+              setAudioPlaybackStatus("ready");
+              reportClientMedia("playback_ready", "track_autoplay_started");
+            })
+            .catch((error: Error) => {
+              const blocked = error.name === "NotAllowedError";
+              setAudioPlaybackStatus(blocked ? "blocked" : "error");
+              reportClientMedia(blocked ? "playback_blocked" : "playback_error", error.name || "track_autoplay_failed");
+            });
         }
         remoteAudioSourceRef.current?.disconnect();
         remoteAnalyserRef.current?.disconnect();
@@ -536,6 +556,7 @@ export default function Home() {
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
         setAudioPlaybackStatus("waiting");
+        reportClientMedia("track_unsubscribed", track.sid);
         const audioElement = remoteAudioElementRef.current;
         if (audioElement) {
           track.detach(audioElement);
@@ -549,6 +570,7 @@ export default function Home() {
       });
       room.on(RoomEvent.AudioPlaybackStatusChanged, (canPlay) => {
         if (roomRef.current !== room) return;
+        reportClientMedia(canPlay ? "playback_ready" : "playback_blocked", "livekit_playback_status");
         setAudioPlaybackStatus(canPlay
           ? remoteAudioElementRef.current?.srcObject ? "ready" : "waiting"
           : "blocked");
@@ -642,30 +664,36 @@ export default function Home() {
     }
   }
 
-  async function resumeRemoteAudio() {
+  function resumeRemoteAudio() {
     const room = roomRef.current;
     const audioElement = remoteAudioElementRef.current;
-    try {
-      await audioContextRef.current?.resume();
-      await room?.startAudio();
+    const operations: Promise<unknown>[] = [];
+    if (audioContextRef.current) operations.push(audioContextRef.current.resume());
+    if (room) operations.push(room.startAudio());
+    if (audioElement?.srcObject) {
+      audioElement.muted = false;
+      audioElement.volume = 1;
+      operations.push(audioElement.play());
+    }
+    void Promise.all(operations).then(() => {
       if (audioElement?.srcObject) {
-        audioElement.muted = false;
-        audioElement.volume = 1;
-        await audioElement.play();
         setAudioPlaybackStatus("ready");
+        reportClientMedia("playback_ready", "user_gesture_resume");
       } else if (room) {
         setAudioPlaybackStatus("waiting");
       }
-    } catch (error) {
-      setAudioPlaybackStatus((error as Error).name === "NotAllowedError" ? "blocked" : "error");
-    }
+    }).catch((error: Error) => {
+      const blocked = error.name === "NotAllowedError";
+      setAudioPlaybackStatus(blocked ? "blocked" : "error");
+      reportClientMedia(blocked ? "playback_blocked" : "playback_error", error.name || "user_gesture_resume_failed");
+    });
   }
 
   function handlePointerDown(event: PointerEvent<HTMLButtonElement>) {
     if ((event.pointerType === "mouse" && event.button !== 0) || activePointerRef.current !== null) return;
     event.preventDefault();
     activePointerRef.current = event.pointerId;
-    void resumeRemoteAudio();
+    resumeRemoteAudio();
     if (mediaStatus === "connected" && micTrackRef.current) {
       void setPtt(true);
     } else if (remoteSession && mediaStatus !== "connecting") {
@@ -795,7 +823,7 @@ export default function Home() {
             <Laptop /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
           </button>
           <div className="session-actions">
-            <button className={`icon-button ${audioPlaybackStatus === "blocked" || audioPlaybackStatus === "error" ? "attention" : ""}`} type="button" onClick={() => void resumeRemoteAudio()} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
+            <button className={`icon-button ${audioPlaybackStatus === "blocked" || audioPlaybackStatus === "error" ? "attention" : ""}`} type="button" onClick={resumeRemoteAudio} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
           </div>
         </header>
         <p className="connection-line"><span className={mediaStatus === "connected" ? "online-dot" : "offline-dot"} /> {connectionStatus}</p>

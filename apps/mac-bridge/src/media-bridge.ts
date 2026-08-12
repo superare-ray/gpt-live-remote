@@ -150,7 +150,7 @@ export class MacAudioBridge {
     this.capture = spawn(ffmpegPath, [
       "-hide_banner", "-loglevel", "error", "-thread_queue_size", "512",
       "-f", "avfoundation", "-i", `:${captureIndex}`,
-      "-af", "pan=mono|c0=0.5*c0+0.5*c1+c2",
+      "-af", "pan=mono|c0=c0+c1+c2+c3+c4+c5+c6+c7+c8+c9+c10+c11+c12+c13+c14+c15",
       "-ac", String(channels), "-ar", String(sampleRate), "-f", "s16le", "pipe:1",
     ], { stdio: ["pipe", "pipe", "pipe"] });
     waitForExit(this.capture, "BlackHole capture");

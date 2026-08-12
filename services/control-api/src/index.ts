@@ -137,6 +137,7 @@ type BridgeMessage =
   | { type: "session.content.history"; sessionId: string; items: SessionContent[]; nextCursor: string | null };
 type PhoneControlMessage =
   | { type: "control.heartbeat" }
+  | { type: "client.media.status"; stage: "track_subscribed" | "track_unsubscribed" | "playback_ready" | "playback_blocked" | "playback_error"; detail?: string }
   | { type: "session.content.history.request"; before?: string | null; limit?: number };
 
 const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie"] } });
@@ -570,6 +571,11 @@ app.get("/api/v1/sessions/:id/ws", { websocket: true }, (socket, request) => {
       const parsed = z.discriminatedUnion("type", [
         z.object({ type: z.literal("control.heartbeat") }),
         z.object({
+          type: z.literal("client.media.status"),
+          stage: z.enum(["track_subscribed", "track_unsubscribed", "playback_ready", "playback_blocked", "playback_error"]),
+          detail: z.string().max(200).optional(),
+        }),
+        z.object({
           type: z.literal("session.content.history.request"),
           before: z.string().max(50).nullable().optional(),
           limit: z.number().int().min(1).max(50).optional(),
@@ -579,6 +585,10 @@ app.get("/api/v1/sessions/:id/ws", { websocket: true }, (socket, request) => {
       const message = parsed.data as PhoneControlMessage;
       if (message.type === "control.heartbeat") {
         return socket.send(JSON.stringify({ type: "control.heartbeat.ack", at: now() }));
+      }
+      if (message.type === "client.media.status") {
+        request.log.info({ sessionId: session.id, stage: message.stage, detail: message.detail }, "phone media status");
+        return;
       }
       const bridge = bridgeSockets.get(session.device_id);
       if (!bridge || bridge.readyState !== 1) return socket.send(JSON.stringify({ type: "control.error", error: "bridge_offline" }));
