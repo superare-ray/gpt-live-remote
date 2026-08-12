@@ -13,6 +13,7 @@ import { z } from "zod";
 
 const env = z.object({
   PORT: z.coerce.number().default(8787),
+  HOST: z.string().default("127.0.0.1"),
   PUBLIC_BASE_URL: z.string().url(),
   DATABASE_PATH: z.string().default("./data/control.sqlite"),
   COOKIE_SECRET: z.string().min(32),
@@ -385,4 +386,4 @@ app.post("/api/v1/sessions/:id/text", async (request, reply) => {
   return forwardSessionEvent(request, reply, { type: "session.text", text: parsed.data.text });
 });
 
-await app.listen({ host: "0.0.0.0", port: env.PORT });
+await app.listen({ host: env.HOST, port: env.PORT });

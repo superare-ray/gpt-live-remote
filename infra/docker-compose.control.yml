@@ -6,6 +6,8 @@ services:
     restart: unless-stopped
     env_file:
       - /opt/gpt-live-remote/secrets/control.env
+    environment:
+      HOST: "0.0.0.0"
     volumes:
       - /opt/gpt-live-remote/data:/data
     ports:
