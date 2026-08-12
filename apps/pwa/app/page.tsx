@@ -37,6 +37,7 @@ type RemoteSession = {
   media?: { url: string; token: string } | null;
 };
 type Mode = "voice" | "text";
+type WaveLevels = [number, number, number];
 const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
 const sessionFailureMessages: Record<string, string> = {
   voice_shortcut_not_configured: "Mac 尚未配置 Voice 快捷键",
@@ -72,8 +73,10 @@ export default function Home() {
   const [pairCode, setPairCode] = useState("");
   const [pairing, setPairing] = useState(false);
   const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [disconnecting, setDisconnecting] = useState(false);
   const [activeDevice, setActiveDevice] = useState<Device | null>(null);
   const [remoteSession, setRemoteSession] = useState<RemoteSession | null>(null);
+  const [showDevicePicker, setShowDevicePicker] = useState(false);
   const [mode, setMode] = useState<Mode>("voice");
   const [talking, setTalking] = useState(false);
   const [text, setText] = useState("");
@@ -83,7 +86,29 @@ export default function Home() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const roomRef = useRef<Room | null>(null);
   const micTrackRef = useRef<LocalAudioTrack | null>(null);
-  const remoteAudioElementsRef = useRef<HTMLMediaElement[]>([]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const localAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const remoteAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const localAnalyserRef = useRef<AnalyserNode | null>(null);
+  const remoteAnalyserRef = useRef<AnalyserNode | null>(null);
+  const talkingRef = useRef(false);
+  const pttQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const [waveLevels, setWaveLevels] = useState<WaveLevels>([0, 0, 0]);
+
+  const closeAudioGraph = useCallback(async () => {
+    localAudioSourceRef.current?.disconnect();
+    remoteAudioSourceRef.current?.disconnect();
+    localAnalyserRef.current?.disconnect();
+    remoteAnalyserRef.current?.disconnect();
+    localAudioSourceRef.current = null;
+    remoteAudioSourceRef.current = null;
+    localAnalyserRef.current = null;
+    remoteAnalyserRef.current = null;
+    const context = audioContextRef.current;
+    audioContextRef.current = null;
+    if (context && context.state !== "closed") await context.close().catch(() => null);
+    setWaveLevels([0, 0, 0]);
+  }, []);
 
   const disconnectMedia = useCallback(async () => {
     const track = micTrackRef.current;
@@ -95,9 +120,8 @@ export default function Home() {
     const room = roomRef.current;
     roomRef.current = null;
     if (room) await room.disconnect();
-    remoteAudioElementsRef.current.forEach((element) => element.remove());
-    remoteAudioElementsRef.current = [];
-  }, []);
+    await closeAudioGraph();
+  }, [closeAudioGraph]);
 
   const loadDevices = useCallback(async () => {
     const result = await request<{ devices: Device[] }>("/api/v1/devices");
@@ -129,6 +153,44 @@ export default function Home() {
       window.removeEventListener("blur", stopTalking);
     };
   });
+
+  useEffect(() => {
+    if (!activeDevice || !remoteSession) return;
+    let animationFrame = 0;
+    let lastUpdate = 0;
+    let smoothed: WaveLevels = [0, 0, 0];
+    const samples = new Uint8Array(256);
+
+    const measure = (analyser: AnalyserNode | null): WaveLevels => {
+      if (!analyser) return [0, 0, 0];
+      analyser.getByteTimeDomainData(samples);
+      const segmentLength = Math.floor(samples.length / 3);
+      return [0, 1, 2].map((segment) => {
+        let energy = 0;
+        const start = segment * segmentLength;
+        const end = segment === 2 ? samples.length : start + segmentLength;
+        for (let index = start; index < end; index += 1) {
+          const normalized = (samples[index] - 128) / 128;
+          energy += normalized * normalized;
+        }
+        const rms = Math.sqrt(energy / (end - start));
+        return Math.min(1, Math.max(0, (rms - 0.008) / 0.22));
+      }) as WaveLevels;
+    };
+
+    const renderMeter = (time: number) => {
+      if (time - lastUpdate >= 45) {
+        const measured = measure(talkingRef.current ? localAnalyserRef.current : remoteAnalyserRef.current);
+        smoothed = smoothed.map((value, index) => value * 0.58 + measured[index] * 0.42) as WaveLevels;
+        setWaveLevels(smoothed);
+        lastUpdate = time;
+      }
+      animationFrame = requestAnimationFrame(renderMeter);
+    };
+
+    animationFrame = requestAnimationFrame(renderMeter);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [activeDevice, remoteSession]);
 
   async function sendLoginCode(event: FormEvent) {
     event.preventDefault();
@@ -174,16 +236,56 @@ export default function Home() {
     }
   }
 
+  async function stopCurrentSession(propagateError = false) {
+    if (!remoteSession || disconnecting) return;
+    setDisconnecting(true);
+    setNotice(null);
+    try {
+      await request(`/api/v1/sessions/${remoteSession.id}/stop`, { method: "POST", body: "{}" });
+      await disconnectMedia();
+      talkingRef.current = false;
+      setTalking(false);
+      setRemoteSession(null);
+      setActiveDevice(null);
+      setShowDevicePicker(true);
+      await loadDevices();
+    } catch (error) {
+      setNotice((error as Error).message);
+      if (propagateError) throw error;
+    } finally {
+      setDisconnecting(false);
+    }
+  }
+
   async function connectDevice(device: Device) {
     setConnectingId(device.id);
     setNotice(null);
+    if (remoteSession) {
+      try {
+        await stopCurrentSession(true);
+      } catch {
+        setConnectingId(null);
+        return;
+      }
+    }
     try {
+      const audioContext = new AudioContext({ latencyHint: "interactive" });
+      audioContextRef.current = audioContext;
+      const audioReady = audioContext.resume();
       const { createLocalAudioTrack, Room, RoomEvent, Track } = await import("livekit-client");
+      await audioReady;
       const localMic = await createLocalAudioTrack({
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
       });
+      const localSource = audioContext.createMediaStreamSource(new MediaStream([localMic.mediaStreamTrack]));
+      const localAnalyser = audioContext.createAnalyser();
+      localAnalyser.fftSize = 256;
+      localAnalyser.smoothingTimeConstant = 0.72;
+      localSource.connect(localAnalyser);
+      localAudioSourceRef.current = localSource;
+      localAnalyserRef.current = localAnalyser;
       const result = await request<{ session: RemoteSession }>("/api/v1/sessions", {
         method: "POST",
         body: JSON.stringify({ deviceId: device.id }),
@@ -192,25 +294,31 @@ export default function Home() {
         const room = new Room({ adaptiveStream: false, dynacast: false });
         room.on(RoomEvent.TrackSubscribed, (track) => {
           if (track.kind !== Track.Kind.Audio) return;
-          const element = track.attach();
-          element.autoplay = true;
-          element.style.display = "none";
-          document.body.appendChild(element);
-          remoteAudioElementsRef.current.push(element);
+          remoteAudioSourceRef.current?.disconnect();
+          remoteAnalyserRef.current?.disconnect();
+          const remoteSource = audioContext.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+          const remoteAnalyser = audioContext.createAnalyser();
+          remoteAnalyser.fftSize = 256;
+          remoteAnalyser.smoothingTimeConstant = 0.72;
+          remoteSource.connect(remoteAnalyser);
+          remoteAnalyser.connect(audioContext.destination);
+          remoteAudioSourceRef.current = remoteSource;
+          remoteAnalyserRef.current = remoteAnalyser;
         });
         room.on(RoomEvent.TrackUnsubscribed, (track) => {
-          track.detach().forEach((element) => {
-            element.remove();
-            remoteAudioElementsRef.current = remoteAudioElementsRef.current.filter((candidate) => candidate !== element);
-          });
+          if (track.kind !== Track.Kind.Audio) return;
+          remoteAudioSourceRef.current?.disconnect();
+          remoteAnalyserRef.current?.disconnect();
+          remoteAudioSourceRef.current = null;
+          remoteAnalyserRef.current = null;
         });
         room.on(RoomEvent.Disconnected, () => {
           if (roomRef.current !== room) return;
           roomRef.current = null;
           micTrackRef.current?.stop();
           micTrackRef.current = null;
-          remoteAudioElementsRef.current.forEach((element) => element.remove());
-          remoteAudioElementsRef.current = [];
+          void closeAudioGraph();
+          talkingRef.current = false;
           setTalking(false);
           setRemoteSession(null);
           setActiveDevice(null);
@@ -221,7 +329,6 @@ export default function Home() {
           name: "phone-microphone",
           source: Track.Source.Microphone,
         });
-        await room.startAudio().catch(() => null);
         roomRef.current = room;
         micTrackRef.current = localMic;
         await request(`/api/v1/sessions/${result.session.id}/media-ready`, { method: "POST", body: "{}" });
@@ -234,6 +341,7 @@ export default function Home() {
           if (pollRef.current) clearInterval(pollRef.current);
           setRemoteSession(latest.session);
           setActiveDevice(device);
+          setShowDevicePicker(false);
           setConnectingId(null);
         } else if (latest.session.status === "failed") {
           if (pollRef.current) clearInterval(pollRef.current);
@@ -252,12 +360,16 @@ export default function Home() {
   }
 
   async function setPtt(active: boolean) {
-    if (!remoteSession || active === talking) return;
+    if (!remoteSession || active === talkingRef.current) return;
+    talkingRef.current = active;
     setTalking(active);
-    await request(`/api/v1/sessions/${remoteSession.id}/ptt`, {
-      method: "POST",
-      body: JSON.stringify({ active }),
+    pttQueueRef.current = pttQueueRef.current.then(async () => {
+      await request(`/api/v1/sessions/${remoteSession.id}/ptt`, {
+        method: "POST",
+        body: JSON.stringify({ active }),
+      });
     }).catch(() => setNotice("控制事件发送失败"));
+    await pttQueueRef.current;
   }
 
   function handlePointerDown(event: PointerEvent<HTMLButtonElement>) {
@@ -320,29 +432,32 @@ export default function Home() {
     );
   }
 
-  if (activeDevice && remoteSession) {
+  if (activeDevice && remoteSession && !showDevicePicker) {
+    const replyActive = !talking && Math.max(...waveLevels) > 0.08;
     return (
       <main className="shell session-shell">
         <header className="session-header">
-          <button className="device-pill" type="button" onClick={() => { void disconnectMedia(); setActiveDevice(null); setRemoteSession(null); }}>
+          <button className="device-pill" type="button" onClick={() => setShowDevicePicker(true)}>
             <Laptop /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
           </button>
-          <button className="mode-button" type="button" onClick={() => setMode(mode === "voice" ? "text" : "voice")}>
-            {mode === "voice" ? <Type /> : <Waves />}{mode === "voice" ? "文字" : "语音"}
-          </button>
+          <div className="session-actions">
+            <button className="session-icon-button" type="button" onClick={() => void audioContextRef.current?.resume()} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
+            <button className="session-icon-button" type="button" onClick={() => setMode(mode === "voice" ? "text" : "voice")} aria-label={mode === "voice" ? "切换到文字" : "切换到语音"} title={mode === "voice" ? "切换到文字" : "切换到语音"}>
+              {mode === "voice" ? <Type /> : <Waves />}
+            </button>
+          </div>
         </header>
         <p className="connection-line"><span className="online-dot" /> 已连接 · 控制通道正常</p>
         {mode === "voice" ? (
           <section className="voice-stage">
-            <p className="voice-status">{talking ? "正在发送到 Mac" : "按住按钮开始说话"}</p>
-            <div className={`voice-dots ${talking ? "active" : ""}`} aria-hidden>
-              <i /><i /><i />
+            <p className="voice-status">{talking ? "正在发送" : replyActive ? "GPT 正在回复" : "按住说话"}</p>
+            <div className={`voice-dots ${talking || replyActive ? "active" : ""}`} aria-hidden>
+              {waveLevels.map((level, index) => <i key={index} style={{ height: `${10 + level * 54}px` }} />)}
             </div>
-            <button className={`ptt ${talking ? "pressed" : ""}`} type="button" onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
-              <Mic /> <span>{talking ? "正在说话" : "按住说话"}</span>
+            <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
+              <Mic />
             </button>
             <p className="helper">松开发送</p>
-            <button className="output-card" type="button"><Volume2 /><span><small>音频输出</small>跟随手机系统</span><ChevronDown /></button>
           </section>
         ) : (
           <section className="text-stage">
@@ -363,17 +478,26 @@ export default function Home() {
 
   return (
     <main className="shell devices-shell">
-      <header className="title-row"><div><p className="eyebrow">GPT-Live Remote</p><h1>我的设备</h1><p>选择一台设备开始连接</p></div><button className="icon-button" onClick={() => void loadDevices()} aria-label="刷新设备"><RefreshCw /></button></header>
+      <header className="title-row">
+        <div><p className="eyebrow">GPT-Live Remote</p><h1>{remoteSession ? "切换设备" : "我的设备"}</h1><p>{remoteSession ? "当前会话会保持连接" : "选择一台设备开始连接"}</p></div>
+        <div className="title-actions">
+          {remoteSession && <button className="icon-button" onClick={() => setShowDevicePicker(false)} aria-label="返回当前会话"><ArrowLeft /></button>}
+          <button className="icon-button" onClick={() => void loadDevices()} aria-label="刷新设备"><RefreshCw /></button>
+        </div>
+      </header>
       <section className="device-list">
-        {devices.map((device) => (
-          <article className="device-card" key={device.id}>
-            <div className="device-icon"><DeviceIcon kind={device.kind} /></div>
-            <div className="device-copy"><strong>{device.name}</strong><span><i className={device.status === "online" ? "online-dot" : "offline-dot"} /> {device.status === "online" ? "在线 · Bridge 已就绪" : "离线"}</span></div>
-            <button className="connect-button" disabled={device.status !== "online" || connectingId !== null} onClick={() => void connectDevice(device)}>
-              {connectingId === device.id ? <LoaderCircle className="spin" aria-label="正在连接" /> : device.status === "online" ? "连接设备" : "不可用"}
-            </button>
-          </article>
-        ))}
+        {devices.map((device) => {
+          const isConnected = remoteSession?.deviceId === device.id;
+          return (
+            <article className={`device-card ${isConnected ? "connected" : ""}`} key={device.id}>
+              <div className="device-icon"><DeviceIcon kind={device.kind} /></div>
+              <div className="device-copy"><strong>{device.name}</strong><span><i className={device.status === "online" ? "online-dot" : "offline-dot"} /> {isConnected ? "当前已连接" : device.status === "online" ? "在线 · Bridge 已就绪" : "离线"}</span></div>
+              <button className={`connect-button ${isConnected ? "disconnect" : ""}`} disabled={device.status !== "online" || connectingId !== null || disconnecting} onClick={() => isConnected ? void stopCurrentSession() : void connectDevice(device)}>
+                {connectingId === device.id || (isConnected && disconnecting) ? <LoaderCircle className="spin" aria-label={isConnected ? "正在断开" : "正在连接"} /> : isConnected ? "断开连接" : device.status === "online" ? "连接设备" : "不可用"}
+              </button>
+            </article>
+          );
+        })}
       </section>
       <form className="pair-card" onSubmit={pairDevice}>
         <div><QrCode /><span><strong>添加 Mac</strong><small>输入 Mac Bridge 显示的配对码</small></span></div>

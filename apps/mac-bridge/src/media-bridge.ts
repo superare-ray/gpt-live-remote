@@ -21,6 +21,7 @@ const sampleRate = 48_000;
 const channels = 1;
 const frameSamples = 480;
 const frameBytes = frameSamples * Int16Array.BYTES_PER_ELEMENT;
+const phoneInputGain = Math.min(1, Math.max(0.05, Number(process.env.PHONE_INPUT_GAIN || 0.35)));
 
 type MediaCredentials = { url: string; token: string };
 
@@ -56,6 +57,23 @@ function waitForExit(child: ChildProcessWithoutNullStreams, label: string) {
   });
 }
 
+async function stopChild(child: ChildProcessWithoutNullStreams | null) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  child.stdin.destroy();
+  child.kill("SIGTERM");
+  await Promise.race([
+    once(child, "exit"),
+    new Promise<void>((resolve) => setTimeout(resolve, 800)),
+  ]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await Promise.race([
+      once(child, "exit"),
+      new Promise<void>((resolve) => setTimeout(resolve, 800)),
+    ]);
+  }
+}
+
 export class MacAudioBridge {
   private room: Room | null = null;
   private playout: ChildProcessWithoutNullStreams | null = null;
@@ -69,6 +87,8 @@ export class MacAudioBridge {
   private pttActive = false;
   private pttFrameCount = 0;
   private pttPeak = 0;
+  private replyPeak = 0;
+  private lastReplyActivityAt = 0;
   private previousDefaults: { inputUid: string; outputUid: string } | null = null;
 
   private async setSessionAudioDefaults(input: string, output: string) {
@@ -134,7 +154,11 @@ export class MacAudioBridge {
         if (!this.pttActive) continue;
         this.pttFrameCount += 1;
         for (const sample of frame.data) this.pttPeak = Math.max(this.pttPeak, Math.abs(sample));
-        const bytes = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
+        const attenuated = new Int16Array(frame.data.length);
+        for (let index = 0; index < frame.data.length; index += 1) {
+          attenuated[index] = Math.round(frame.data[index] * phoneInputGain);
+        }
+        const bytes = Buffer.from(attenuated.buffer, attenuated.byteOffset, attenuated.byteLength);
         if (!writer.write(bytes)) await once(writer, "drain");
       }
     } catch (error) {
@@ -154,10 +178,24 @@ export class MacAudioBridge {
     const peakDb = this.pttPeak > 0
       ? (20 * Math.log10(this.pttPeak / 32_768)).toFixed(1)
       : "-∞";
-    console.log(`  媒体实测：${this.pttFrameCount} 帧，峰值 ${peakDb} dBFS`);
+    const routedPeakDb = this.pttPeak > 0
+      ? (20 * Math.log10((this.pttPeak * phoneInputGain) / 32_768)).toFixed(1)
+      : "-∞";
+    console.log(`  媒体实测：${this.pttFrameCount} 帧，手机 ${peakDb} dBFS → GPT ${routedPeakDb} dBFS`);
   }
 
   private enqueueCapturedAudio(chunk: Buffer) {
+    const capturedSamples = new Int16Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / Int16Array.BYTES_PER_ELEMENT));
+    for (const sample of capturedSamples) this.replyPeak = Math.max(this.replyPeak, Math.abs(sample));
+    const now = Date.now();
+    if (this.replyPeak >= 256 && now - this.lastReplyActivityAt >= 1_000) {
+      const peakDb = (20 * Math.log10(this.replyPeak / 32_768)).toFixed(1);
+      console.log(`🔊 GPT 回传音频活动：峰值 ${peakDb} dBFS`);
+      this.replyPeak = 0;
+      this.lastReplyActivityAt = now;
+    } else if (now - this.lastReplyActivityAt >= 1_000) {
+      this.replyPeak = 0;
+    }
     this.pendingCapture = Buffer.concat([this.pendingCapture, chunk]);
     const frames: Buffer[] = [];
     while (this.pendingCapture.length >= frameBytes) {
@@ -182,8 +220,9 @@ export class MacAudioBridge {
     this.closed = true;
     this.pttActive = false;
     await this.remoteStream?.cancel().catch(() => null);
-    this.playout?.kill("SIGTERM");
-    this.capture?.kill("SIGTERM");
+    await Promise.all([stopChild(this.playout), stopChild(this.capture)]);
+    this.playout = null;
+    this.capture = null;
     await this.localTrack?.close().catch(() => null);
     await this.source?.close().catch(() => null);
     await this.room?.disconnect();

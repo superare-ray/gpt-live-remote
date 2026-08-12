@@ -110,7 +110,9 @@ type BridgeMessage =
   | { type: "pairing.approve"; requestId: string }
   | { type: "pairing.reject"; requestId: string }
   | { type: "session.ready"; sessionId: string }
-  | { type: "session.failed"; sessionId: string; reason?: string };
+  | { type: "session.failed"; sessionId: string; reason?: string }
+  | { type: "session.stopped"; sessionId: string }
+  | { type: "session.stop_failed"; sessionId: string; reason?: string };
 
 const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie"] } });
 await app.register(cookie);
@@ -306,6 +308,14 @@ app.get("/api/v1/bridge/ws", { websocket: true }, (socket, request) => {
             message.sessionId,
             device.id,
           );
+      } else if (message.type === "session.stopped" || message.type === "session.stop_failed") {
+        db.prepare("UPDATE remote_sessions SET status = ?, failure_reason = ? WHERE id = ? AND device_id = ?")
+          .run(
+            message.type === "session.stopped" ? "stopped" : "stop_failed",
+            message.type === "session.stop_failed" ? message.reason || "desktop_stop_failed" : null,
+            message.sessionId,
+            device.id,
+          );
       }
     } catch (error) {
       request.log.warn({ error }, "invalid bridge message");
@@ -416,6 +426,28 @@ app.get("/api/v1/sessions/:id", async (request, reply) => {
   const session = db.prepare("SELECT id, device_id as deviceId, status, failure_reason as failureReason FROM remote_sessions WHERE id = ? AND user_id = ?").get(id.data, user.id);
   if (!session) return reply.code(404).send({ error: "找不到会话" });
   return { session };
+});
+
+app.post("/api/v1/sessions/:id/stop", async (request, reply) => {
+  const user = requireUser(request, reply);
+  if (!user) return;
+  const id = z.string().uuid().safeParse((request.params as { id?: string }).id);
+  if (!id.success) return reply.code(400).send({ error: "会话信息无效" });
+  const session = db.prepare("SELECT id, device_id, status FROM remote_sessions WHERE id = ? AND user_id = ?")
+    .get(id.data, user.id) as { id: string; device_id: string; status: string } | undefined;
+  if (!session) return reply.code(404).send({ error: "找不到会话" });
+  if (session.status === "stopped") return { ok: true };
+  const socket = bridgeSockets.get(session.device_id);
+  if (!socket) return reply.code(409).send({ error: "Mac Bridge 已离线，无法确认 GPT Voice 已关闭" });
+
+  socket.send(JSON.stringify({ type: "session.stop", sessionId: session.id }));
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    await delay(500);
+    const latest = db.prepare("SELECT status, failure_reason FROM remote_sessions WHERE id = ?").get(session.id) as { status: string; failure_reason: string | null };
+    if (latest.status === "stopped") return { ok: true };
+    if (latest.status === "stop_failed") return reply.code(409).send({ error: latest.failure_reason || "Mac 未能关闭 GPT Voice" });
+  }
+  return reply.code(504).send({ error: "等待 Mac 关闭 GPT Voice 超时" });
 });
 
 function forwardSessionEvent(request: FastifyRequest, reply: FastifyReply, event: Record<string, unknown>) {

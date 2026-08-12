@@ -5,7 +5,7 @@ import { createInterface } from "node:readline/promises";
 import process from "node:process";
 import qrcode from "qrcode-terminal";
 import WebSocket from "ws";
-import { desktopVoiceConfigFromEnv, startAndVerifyVoice } from "./desktop-voice.js";
+import { desktopVoiceConfigFromEnv, startAndVerifyVoice, stopAndVerifyVoice } from "./desktop-voice.js";
 import { MacAudioBridge } from "./media-bridge.js";
 
 type DeviceConfig = { id: string; name: string; kind: "macbook" | "macmini"; secret: string };
@@ -14,6 +14,7 @@ type ServerMessage =
   | { type: "bridge.heartbeat.ack"; at: number }
   | { type: "pairing.request"; requestId: string; email: string; confirmationCode: string }
   | { type: "session.start"; sessionId: string; media?: { url: string; token: string } | null }
+  | { type: "session.stop"; sessionId: string }
   | { type: "session.ptt"; sessionId: string; active: boolean }
   | { type: "session.text"; sessionId: string; text: string };
 
@@ -80,6 +81,7 @@ const socket = new WebSocket(wsUrl, {
 });
 let heartbeat: NodeJS.Timeout | null = null;
 let activeMedia: MacAudioBridge | null = null;
+let activeSessionId: string | null = null;
 
 socket.on("open", async () => {
   console.log("✓ 控制通道已连接");
@@ -111,12 +113,14 @@ socket.on("message", async (raw) => {
       await activeMedia.connect(message.media);
       console.log("✓ 双向 WebRTC 与 BlackHole 音频链路已就绪");
       if (process.env.MEDIA_ONLY_MODE === "true") {
+        activeSessionId = message.sessionId;
         console.log("✓ 媒体测试模式：跳过 ChatGPT Voice 启动\n");
         socket.send(JSON.stringify({ type: "session.ready", sessionId: message.sessionId }));
         return;
       }
       const config = desktopVoiceConfigFromEnv();
       await startAndVerifyVoice(config);
+      activeSessionId = message.sessionId;
       console.log("✓ ChatGPT Voice 界面已验证\n");
       socket.send(JSON.stringify({ type: "session.ready", sessionId: message.sessionId }));
     } catch (error) {
@@ -124,7 +128,28 @@ socket.on("message", async (raw) => {
       console.error(`✗ ChatGPT Voice 启动未确认：${reason}\n`);
       await activeMedia?.close();
       activeMedia = null;
+      activeSessionId = null;
       socket.send(JSON.stringify({ type: "session.failed", sessionId: message.sessionId, reason }));
+    }
+  } else if (message.type === "session.stop") {
+    if (activeSessionId && activeSessionId !== message.sessionId) {
+      socket.send(JSON.stringify({ type: "session.stopped", sessionId: message.sessionId }));
+      return;
+    }
+    console.log(`\n■ 收到断开请求 ${message.sessionId.slice(0, 8)}`);
+    try {
+      await activeMedia?.close();
+      activeMedia = null;
+      if (process.env.MEDIA_ONLY_MODE !== "true") {
+        await stopAndVerifyVoice(desktopVoiceConfigFromEnv());
+      }
+      activeSessionId = null;
+      console.log("✓ 媒体链路与 GPT Voice 已关闭\n");
+      socket.send(JSON.stringify({ type: "session.stopped", sessionId: message.sessionId }));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "desktop_stop_failed";
+      console.error(`✗ GPT Voice 关闭未确认：${reason}\n`);
+      socket.send(JSON.stringify({ type: "session.stop_failed", sessionId: message.sessionId, reason }));
     }
   } else if (message.type === "session.ptt") {
     activeMedia?.setPtt(message.active);

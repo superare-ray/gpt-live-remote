@@ -168,3 +168,23 @@ export async function startAndVerifyVoice(config: DesktopVoiceConfig) {
   }
   throw new Error("voice_ui_state_unverified");
 }
+
+export async function stopAndVerifyVoice(config: DesktopVoiceConfig) {
+  if (config.activePattern) {
+    const currentSnapshot = await readAccessibilitySnapshot(config.bundleId);
+    if (!config.activePattern.test(currentSnapshot)) return { verified: true };
+  }
+
+  await triggerShortcut(config);
+  if (!config.activePattern) return { verified: false };
+
+  const deadline = Date.now() + config.timeoutMs;
+  let consecutiveStops = 0;
+  while (Date.now() < deadline) {
+    const snapshot = await readAccessibilitySnapshot(config.bundleId);
+    consecutiveStops = config.activePattern.test(snapshot) ? 0 : consecutiveStops + 1;
+    if (consecutiveStops >= 2) return { verified: true };
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error("voice_ui_stop_unverified");
+}

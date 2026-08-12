@@ -6,5 +6,5 @@ Current message families:
 
 - `bridge.hello`, `bridge.heartbeat`
 - `pairing.request`, `pairing.approve`, `pairing.reject`
-- `session.start`, `session.ready`, `session.failed`
+- `session.start`, `session.ready`, `session.failed`, `session.stop`, `session.stopped`, `session.stop_failed`
 - `session.ptt`, `session.text`
