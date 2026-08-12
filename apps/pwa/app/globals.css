@@ -15,7 +15,7 @@
 html { background: var(--bg); }
 body { margin: 0; background: radial-gradient(circle at 50% -10%, #14271d 0, var(--bg) 42%); color: var(--text); font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; }
 button, input { font: inherit; }
-button { -webkit-tap-highlight-color: transparent; }
+button { font-size: 15px; -webkit-tap-highlight-color: transparent; }
 button:not(:disabled) { cursor: pointer; transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease, background-color 120ms ease; }
 button:not(:disabled):active { transform: scale(.95); filter: brightness(1.06); }
 button:focus-visible { outline: 2px solid var(--sage); outline-offset: 3px; }
@@ -53,9 +53,10 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .devices-shell { padding-top: max(60px, env(safe-area-inset-top)); }
 .title-row { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 34px; }
 .title-actions { display: flex; gap: 8px; }
-.title-actions .icon-button { width: 40px; height: 40px; border-radius: 13px; }
-.title-actions .icon-button svg { width: 18px; height: 18px; }
-.icon-button { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 16px; border: 1px solid var(--border); color: var(--sage); background: var(--surface); }
+.icon-button { width: 44px; height: 44px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; color: var(--sage-strong); background: transparent; }
+.icon-button svg { width: 20px; height: 20px; stroke-width: 2; }
+.icon-button:not(:disabled):hover { background: rgba(157,184,163,.08); }
+.icon-button:not(:disabled):active { background: rgba(157,184,163,.14); }
 .device-list { display: grid; gap: 14px; }
 .device-card { display: grid; grid-template-columns: 58px minmax(0,1fr) auto; align-items: center; gap: 15px; padding: 18px; border-radius: 20px; border: 1px solid var(--border); background: rgba(13,25,19,.86); }
 .device-card.connected { border-color: rgba(120,165,134,.52); background: rgba(18,37,27,.92); }
@@ -88,8 +89,6 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .device-pill svg:first-child { width: 18px; color: var(--sage); }
 .device-pill svg:last-child { width: 17px; margin-left: auto; color: var(--muted); }
 .session-actions { display: flex; gap: 8px; }
-.session-icon-button { width: 44px; height: 44px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 50%; color: var(--sage-strong); background: rgba(13,25,19,.82); }
-.session-icon-button svg { width: 19px; height: 19px; }
 .connection-line { display: flex; align-items: center; gap: 7px; margin: 12px 2px 0; color: var(--muted); font-size: 13px; }
 .voice-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 14px 0 24px; }
 .voice-status { min-height: 20px; margin: 0; color: var(--sage); font-size: 14px; }
@@ -116,7 +115,7 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
   .shell { padding-left: 16px; padding-right: 16px; }
   .device-card { grid-template-columns: 48px minmax(0,1fr) auto; gap: 10px; padding: 14px; }
   .device-icon { width: 46px; height: 46px; }
-  .connect-button { min-width: 82px; font-size: 13px; }
+  .connect-button { min-width: 82px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

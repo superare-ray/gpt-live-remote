@@ -21,7 +21,6 @@ const sampleRate = 48_000;
 const channels = 1;
 const frameSamples = 480;
 const frameBytes = frameSamples * Int16Array.BYTES_PER_ELEMENT;
-const phoneInputGain = Math.min(1, Math.max(0.05, Number(process.env.PHONE_INPUT_GAIN || 0.35)));
 
 type MediaCredentials = { url: string; token: string };
 
@@ -148,11 +147,7 @@ export class MacAudioBridge {
     try {
       for await (const frame of stream) {
         if (this.closed) break;
-        const attenuated = new Int16Array(frame.data.length);
-        for (let index = 0; index < frame.data.length; index += 1) {
-          attenuated[index] = Math.round(frame.data[index] * phoneInputGain);
-        }
-        const bytes = Buffer.from(attenuated.buffer, attenuated.byteOffset, attenuated.byteLength);
+        const bytes = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
         if (!writer.write(bytes)) await once(writer, "drain");
       }
     } catch (error) {
