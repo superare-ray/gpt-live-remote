@@ -7,7 +7,7 @@ export type DesktopVoiceConfig = {
   bundleId: string;
   shortcutKey: string;
   shortcutModifiers: Set<"command" | "control" | "option" | "shift">;
-  activePattern: RegExp;
+  activePattern: RegExp | null;
   timeoutMs: number;
 };
 
@@ -23,22 +23,22 @@ function parseBoolean(value: string) {
 }
 
 export function desktopVoiceConfigFromEnv(): DesktopVoiceConfig {
-  const shortcutKey = process.env.VOICE_SHORTCUT_KEY?.trim();
+  const shortcutKey = process.env.VOICE_SHORTCUT_KEY?.trim() || "v";
   const shortcutModifiers = process.env.VOICE_SHORTCUT_MODIFIERS?.split(",")
     .map((value) => value.trim().toLowerCase())
     .filter(Boolean) ?? [];
   const allowedModifiers = new Set(["command", "control", "option", "shift"]);
-  if (!shortcutKey) throw new Error("voice_shortcut_not_configured");
   if (shortcutModifiers.some((value) => !allowedModifiers.has(value))) {
     throw new Error("voice_shortcut_modifiers_invalid");
   }
-  const activeMatch = process.env.VOICE_ACTIVE_AX_MATCH?.trim();
-  if (!activeMatch) throw new Error("voice_state_probe_not_configured");
-  let activePattern: RegExp;
-  try {
-    activePattern = new RegExp(activeMatch, "iu");
-  } catch {
-    throw new Error("voice_state_probe_pattern_invalid");
+  const activeMatch = process.env.VOICE_ACTIVE_AX_MATCH?.trim() || "Codex Pet Voice Controls|Voice Controls Glass";
+  let activePattern: RegExp | null = null;
+  if (activeMatch) {
+    try {
+      activePattern = new RegExp(activeMatch, "iu");
+    } catch {
+      throw new Error("voice_state_probe_pattern_invalid");
+    }
   }
   return {
     bundleId: process.env.CHATGPT_BUNDLE_ID?.trim() || "com.openai.chat",
@@ -102,16 +102,21 @@ on run argv
     set targetProcess to first application process whose bundle identifier is appBundleId
     if (count of windows of targetProcess) is 0 then return ""
     set output to ""
-    set allElements to entire contents of front window of targetProcess
-    repeat with elementRef in allElements
-      set rowText to ""
-      repeat with attributeName in {"AXRole", "AXSubrole", "AXIdentifier", "AXTitle", "AXDescription", "AXValue", "AXHelp"}
-        try
-          set attributeValue to value of attribute (contents of attributeName) of elementRef
-          if attributeValue is not missing value then set rowText to rowText & (contents of attributeName) & "=" & (attributeValue as text) & tab
-        end try
+    repeat with windowRef in windows of targetProcess
+      try
+        set output to output & "AXWindowTitle=" & (name of windowRef as text) & linefeed
+      end try
+      set allElements to entire contents of windowRef
+      repeat with elementRef in allElements
+        set rowText to ""
+        repeat with attributeName in {"AXRole", "AXSubrole", "AXIdentifier", "AXTitle", "AXDescription", "AXValue", "AXHelp"}
+          try
+            set attributeValue to value of attribute (contents of attributeName) of elementRef
+            if attributeValue is not missing value then set rowText to rowText & (contents of attributeName) & "=" & (attributeValue as text) & tab
+          end try
+        end repeat
+        if rowText is not "" then set output to output & rowText & linefeed
       end repeat
-      if rowText is not "" then set output to output & rowText & linefeed
     end repeat
     return output
   end tell
@@ -146,6 +151,16 @@ export async function startAndVerifyVoice(config: DesktopVoiceConfig) {
 
   await triggerShortcut(config);
   const deadline = Date.now() + config.timeoutMs;
+  if (!config.activePattern) {
+    // Electron currently exposes Voice state inside its renderer rather than the
+    // native AX tree. We can still verify the app's audio service transition.
+    while (Date.now() < deadline) {
+      const { stdout } = await execFileAsync("/usr/bin/pgrep", ["-f", "utility-sub-type=audio.mojom.AudioService"]).catch(() => ({ stdout: "", stderr: "" }));
+      if (stdout.trim()) return { verified: true, preflight };
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error("voice_audio_service_unverified");
+  }
   let consecutiveMatches = 0;
   while (Date.now() < deadline) {
     const snapshot = await readAccessibilitySnapshot(config.bundleId);

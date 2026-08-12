@@ -19,6 +19,7 @@ import {
   Waves,
 } from "lucide-react";
 import { FormEvent, PointerEvent, useCallback, useEffect, useRef, useState } from "react";
+import type { LocalAudioTrack, Room } from "livekit-client";
 
 type AuthUser = { id: string; email: string };
 type Device = {
@@ -28,7 +29,13 @@ type Device = {
   status: "online" | "offline";
   lastSeen: string | null;
 };
-type RemoteSession = { id: string; deviceId: string; status: "starting" | "ready" | "failed"; failureReason?: string | null };
+type RemoteSession = {
+  id: string;
+  deviceId: string;
+  status: "starting" | "ready" | "failed";
+  failureReason?: string | null;
+  media?: { url: string; token: string } | null;
+};
 type Mode = "voice" | "text";
 const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
 const sessionFailureMessages: Record<string, string> = {
@@ -74,6 +81,23 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const roomRef = useRef<Room | null>(null);
+  const micTrackRef = useRef<LocalAudioTrack | null>(null);
+  const remoteAudioElementsRef = useRef<HTMLMediaElement[]>([]);
+
+  const disconnectMedia = useCallback(async () => {
+    const track = micTrackRef.current;
+    micTrackRef.current = null;
+    if (track) {
+      await track.mute().catch(() => null);
+      track.stop();
+    }
+    const room = roomRef.current;
+    roomRef.current = null;
+    if (room) await room.disconnect();
+    remoteAudioElementsRef.current.forEach((element) => element.remove());
+    remoteAudioElementsRef.current = [];
+  }, []);
 
   const loadDevices = useCallback(async () => {
     const result = await request<{ devices: Device[] }>("/api/v1/devices");
@@ -90,8 +114,21 @@ export default function Home() {
       .finally(() => setLoading(false));
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      void disconnectMedia();
     };
-  }, [loadDevices]);
+  }, [disconnectMedia, loadDevices]);
+
+  useEffect(() => {
+    const stopTalking = () => {
+      if (document.visibilityState === "hidden" || !document.hasFocus()) void setPtt(false);
+    };
+    document.addEventListener("visibilitychange", stopTalking);
+    window.addEventListener("blur", stopTalking);
+    return () => {
+      document.removeEventListener("visibilitychange", stopTalking);
+      window.removeEventListener("blur", stopTalking);
+    };
+  });
 
   async function sendLoginCode(event: FormEvent) {
     event.preventDefault();
@@ -141,10 +178,45 @@ export default function Home() {
     setConnectingId(device.id);
     setNotice(null);
     try {
+      const { createLocalAudioTrack, Room, RoomEvent, Track } = await import("livekit-client");
+      const localMic = await createLocalAudioTrack({
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      });
+      await localMic.mute();
       const result = await request<{ session: RemoteSession }>("/api/v1/sessions", {
         method: "POST",
         body: JSON.stringify({ deviceId: device.id }),
       });
+      if (result.session.media) {
+        const room = new Room({ adaptiveStream: false, dynacast: false });
+        room.on(RoomEvent.TrackSubscribed, (track) => {
+          if (track.kind !== Track.Kind.Audio) return;
+          const element = track.attach();
+          element.autoplay = true;
+          element.style.display = "none";
+          document.body.appendChild(element);
+          remoteAudioElementsRef.current.push(element);
+        });
+        room.on(RoomEvent.TrackUnsubscribed, (track) => {
+          track.detach().forEach((element) => {
+            element.remove();
+            remoteAudioElementsRef.current = remoteAudioElementsRef.current.filter((candidate) => candidate !== element);
+          });
+        });
+        await room.connect(result.session.media.url, result.session.media.token, { autoSubscribe: true });
+        await room.localParticipant.publishTrack(localMic, {
+          name: "phone-microphone",
+          source: Track.Source.Microphone,
+        });
+        await room.startAudio().catch(() => null);
+        roomRef.current = room;
+        micTrackRef.current = localMic;
+        await request(`/api/v1/sessions/${result.session.id}/media-ready`, { method: "POST", body: "{}" });
+      } else {
+        localMic.stop();
+      }
       const poll = async () => {
         const latest = await request<{ session: RemoteSession }>(`/api/v1/sessions/${result.session.id}`);
         if (latest.session.status === "ready") {
@@ -155,6 +227,7 @@ export default function Home() {
         } else if (latest.session.status === "failed") {
           if (pollRef.current) clearInterval(pollRef.current);
           setConnectingId(null);
+          await disconnectMedia();
           setNotice(sessionFailureMessages[latest.session.failureReason || ""] || "连接失败，请检查 Mac Bridge 的诊断信息");
         }
       };
@@ -162,6 +235,7 @@ export default function Home() {
       pollRef.current = setInterval(() => void poll().catch(() => null), 900);
     } catch (error) {
       setConnectingId(null);
+      await disconnectMedia();
       setNotice((error as Error).message);
     }
   }
@@ -169,6 +243,11 @@ export default function Home() {
   async function setPtt(active: boolean) {
     if (!remoteSession || active === talking) return;
     setTalking(active);
+    const track = micTrackRef.current;
+    if (track) {
+      if (active) await track.unmute();
+      else await track.mute();
+    }
     await request(`/api/v1/sessions/${remoteSession.id}/ptt`, {
       method: "POST",
       body: JSON.stringify({ active }),
@@ -239,7 +318,7 @@ export default function Home() {
     return (
       <main className="shell session-shell">
         <header className="session-header">
-          <button className="device-pill" type="button" onClick={() => { setActiveDevice(null); setRemoteSession(null); }}>
+          <button className="device-pill" type="button" onClick={() => { void disconnectMedia(); setActiveDevice(null); setRemoteSession(null); }}>
             <Laptop /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
           </button>
           <button className="mode-button" type="button" onClick={() => setMode(mode === "voice" ? "text" : "voice")}>

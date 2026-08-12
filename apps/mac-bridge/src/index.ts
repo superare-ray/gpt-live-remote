@@ -6,13 +6,14 @@ import process from "node:process";
 import qrcode from "qrcode-terminal";
 import WebSocket from "ws";
 import { desktopVoiceConfigFromEnv, startAndVerifyVoice } from "./desktop-voice.js";
+import { MacAudioBridge } from "./media-bridge.js";
 
 type DeviceConfig = { id: string; name: string; kind: "macbook" | "macmini"; secret: string };
 type ServerMessage =
   | { type: "bridge.hello"; deviceId: string }
   | { type: "bridge.heartbeat.ack"; at: number }
   | { type: "pairing.request"; requestId: string; email: string; confirmationCode: string }
-  | { type: "session.start"; sessionId: string }
+  | { type: "session.start"; sessionId: string; media?: { url: string; token: string } | null }
   | { type: "session.ptt"; sessionId: string; active: boolean }
   | { type: "session.text"; sessionId: string; text: string };
 
@@ -78,6 +79,7 @@ const socket = new WebSocket(wsUrl, {
   headers: { authorization: `Bearer ${device.secret}` },
 });
 let heartbeat: NodeJS.Timeout | null = null;
+let activeMedia: MacAudioBridge | null = null;
 
 socket.on("open", async () => {
   console.log("✓ 控制通道已连接");
@@ -103,6 +105,16 @@ socket.on("message", async (raw) => {
     console.log(`\n▶ 收到启动请求 ${message.sessionId.slice(0, 8)}`);
     console.log("  正在激活 ChatGPT 并验证 Voice 界面状态…");
     try {
+      if (!message.media?.url || !message.media.token) throw new Error("media_credentials_missing");
+      await activeMedia?.close();
+      activeMedia = new MacAudioBridge();
+      await activeMedia.connect(message.media);
+      console.log("✓ 双向 WebRTC 与 BlackHole 音频链路已就绪");
+      if (process.env.MEDIA_ONLY_MODE === "true") {
+        console.log("✓ 媒体测试模式：跳过 ChatGPT Voice 启动\n");
+        socket.send(JSON.stringify({ type: "session.ready", sessionId: message.sessionId }));
+        return;
+      }
       const config = desktopVoiceConfigFromEnv();
       await startAndVerifyVoice(config);
       console.log("✓ ChatGPT Voice 界面已验证\n");
@@ -110,6 +122,8 @@ socket.on("message", async (raw) => {
     } catch (error) {
       const reason = error instanceof Error ? error.message : "desktop_start_failed";
       console.error(`✗ ChatGPT Voice 启动未确认：${reason}\n`);
+      await activeMedia?.close();
+      activeMedia = null;
       socket.send(JSON.stringify({ type: "session.failed", sessionId: message.sessionId, reason }));
     }
   } else if (message.type === "session.ptt") {
@@ -128,6 +142,7 @@ socket.on("close", (code, reason) => {
 
 socket.on("error", (error) => console.error(`连接错误：${error.message}`));
 process.on("SIGINT", () => {
+  void activeMedia?.close();
   socket.close(1000, "user exit");
   readline.close();
 });

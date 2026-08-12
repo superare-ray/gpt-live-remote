@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type WebSocket from "ws";
 import type { RawData } from "ws";
 import { z } from "zod";
+import { AccessToken } from "livekit-server-sdk";
 
 const env = z.object({
   PORT: z.coerce.number().default(8787),
@@ -20,7 +21,16 @@ const env = z.object({
   BRIDGE_ENROLLMENT_TOKEN: z.string().min(24),
   AUTH_DEMO_CODE: z.string().regex(/^\d{6}$/).optional(),
   SESSION_COOKIE_SECURE: z.enum(["true", "false"]).default("true"),
+  LIVEKIT_URL: z.string().url().optional(),
+  LIVEKIT_API_KEY: z.string().min(8).optional(),
+  LIVEKIT_API_SECRET: z.string().min(24).optional(),
 }).parse(process.env);
+
+const liveKitValues = [env.LIVEKIT_URL, env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET].filter(Boolean);
+if (liveKitValues.length !== 0 && liveKitValues.length !== 3) {
+  throw new Error("LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be configured together");
+}
+const liveKitConfigured = liveKitValues.length === 3;
 
 mkdirSync(dirname(env.DATABASE_PATH), { recursive: true });
 const db = new Database(env.DATABASE_PATH);
@@ -88,6 +98,11 @@ try {
 } catch (error) {
   if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
 }
+try {
+  db.exec("ALTER TABLE remote_sessions ADD COLUMN start_dispatched INTEGER NOT NULL DEFAULT 0");
+} catch (error) {
+  if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
+}
 
 type User = { id: string; email: string };
 type BridgeMessage =
@@ -116,6 +131,13 @@ const maskedEmail = (email: string) => {
   const [name, domain] = email.split("@");
   return `${name.slice(0, 1)}***@${domain}`;
 };
+
+async function liveKitToken(room: string, identity: string) {
+  if (!liveKitConfigured) return null;
+  const token = new AccessToken(env.LIVEKIT_API_KEY!, env.LIVEKIT_API_SECRET!, { identity, ttl: 5 * 60 });
+  token.addGrant({ roomJoin: true, room, canPublish: true, canSubscribe: true });
+  return token.toJwt();
+}
 
 function normalizeEmail(value: string) {
   return value.trim().toLowerCase();
@@ -352,8 +374,38 @@ app.post("/api/v1/sessions", async (request, reply) => {
   const session = { id: randomUUID(), deviceId: device.id, status: "starting" as const };
   db.prepare("INSERT INTO remote_sessions(id, device_id, user_id, status, created_at) VALUES (?, ?, ?, 'starting', ?)")
     .run(session.id, device.id, user.id, now());
-  socket.send(JSON.stringify({ type: "session.start", sessionId: session.id }));
-  return { session };
+  if (!liveKitConfigured) {
+    db.prepare("UPDATE remote_sessions SET start_dispatched = 1 WHERE id = ?").run(session.id);
+    socket.send(JSON.stringify({ type: "session.start", sessionId: session.id }));
+    return { session };
+  }
+  const token = await liveKitToken(session.id, `phone:${user.id}`);
+  return { session: { ...session, media: { url: env.LIVEKIT_URL, token } } };
+});
+
+app.post("/api/v1/sessions/:id/media-ready", async (request, reply) => {
+  const user = requireUser(request, reply);
+  if (!user) return;
+  if (!liveKitConfigured) return reply.code(409).send({ error: "媒体服务尚未配置" });
+  const id = z.string().uuid().safeParse((request.params as { id?: string }).id);
+  if (!id.success) return reply.code(400).send({ error: "会话信息无效" });
+  const session = db.prepare("SELECT id, device_id, status, start_dispatched FROM remote_sessions WHERE id = ? AND user_id = ?")
+    .get(id.data, user.id) as { id: string; device_id: string; status: string; start_dispatched: number } | undefined;
+  if (!session) return reply.code(404).send({ error: "找不到会话" });
+  if (session.status !== "starting") return { ok: session.status === "ready" };
+  const socket = bridgeSockets.get(session.device_id);
+  if (!socket) return reply.code(409).send({ error: "Mac Bridge 当前不在线" });
+  if (session.start_dispatched) return { ok: true };
+  const token = await liveKitToken(session.id, `bridge:${session.device_id}`);
+  const claimed = db.prepare("UPDATE remote_sessions SET start_dispatched = 1 WHERE id = ? AND start_dispatched = 0").run(session.id);
+  if (claimed.changes) {
+    socket.send(JSON.stringify({
+      type: "session.start",
+      sessionId: session.id,
+      media: { url: env.LIVEKIT_URL, token },
+    }));
+  }
+  return { ok: true };
 });
 
 app.get("/api/v1/sessions/:id", async (request, reply) => {
