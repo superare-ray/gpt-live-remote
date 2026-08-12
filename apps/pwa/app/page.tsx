@@ -42,6 +42,7 @@ type ContentEntry = {
   label?: string;
 };
 type WaveLevels = [number, number, number];
+type AudioPlaybackStatus = "idle" | "waiting" | "ready" | "blocked" | "error";
 const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
 const sessionFailureMessages: Record<string, string> = {
   voice_shortcut_not_configured: "Mac 尚未配置 Voice 快捷键",
@@ -110,6 +111,7 @@ export default function Home() {
   const [contentItems, setContentItems] = useState<ContentEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [mediaStatus, setMediaStatus] = useState<"idle" | "connecting" | "connected">("idle");
+  const [audioPlaybackStatus, setAudioPlaybackStatus] = useState<AudioPlaybackStatus>("idle");
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const roomRef = useRef<Room | null>(null);
@@ -192,6 +194,7 @@ export default function Home() {
   const disconnectMedia = useCallback(async () => {
     mediaConnectionAttemptRef.current += 1;
     setMediaStatus("idle");
+    setAudioPlaybackStatus("idle");
     const track = micTrackRef.current;
     micTrackRef.current = null;
     if (track) {
@@ -217,12 +220,18 @@ export default function Home() {
     audioElement.playsInline = true;
     audioElement.preload = "auto";
     audioElement.style.display = "none";
+    const handlePlaying = () => setAudioPlaybackStatus("ready");
+    const handleError = () => setAudioPlaybackStatus("error");
+    audioElement.addEventListener("playing", handlePlaying);
+    audioElement.addEventListener("error", handleError);
     document.body.appendChild(audioElement);
     remoteAudioElementRef.current = audioElement;
     return () => {
       if (remoteAudioElementRef.current === audioElement) remoteAudioElementRef.current = null;
       audioElement.pause();
       audioElement.srcObject = null;
+      audioElement.removeEventListener("playing", handlePlaying);
+      audioElement.removeEventListener("error", handleError);
       audioElement.remove();
     };
   }, []);
@@ -463,6 +472,7 @@ export default function Home() {
       if (mediaConnectionAttemptRef.current !== attempt) throw new Error("连接已取消");
     };
     setMediaStatus("connecting");
+    setAudioPlaybackStatus("waiting");
 
     try {
       const audioContext = new AudioContext({ latencyHint: "interactive" });
@@ -497,12 +507,16 @@ export default function Home() {
       roomRef.current = room;
       room.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
+        setAudioPlaybackStatus("waiting");
         const audioElement = remoteAudioElementRef.current;
         if (audioElement) {
           track.attach(audioElement);
           audioElement.muted = false;
           audioElement.volume = 1;
-          void audioElement.play().catch(() => null);
+          void room.startAudio()
+            .then(() => audioElement.play())
+            .then(() => setAudioPlaybackStatus("ready"))
+            .catch((error: Error) => setAudioPlaybackStatus(error.name === "NotAllowedError" ? "blocked" : "error"));
         }
         remoteAudioSourceRef.current?.disconnect();
         remoteAnalyserRef.current?.disconnect();
@@ -521,6 +535,7 @@ export default function Home() {
       });
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
+        setAudioPlaybackStatus("waiting");
         const audioElement = remoteAudioElementRef.current;
         if (audioElement) {
           track.detach(audioElement);
@@ -531,6 +546,12 @@ export default function Home() {
         remoteAnalyserRef.current?.disconnect();
         remoteAudioSourceRef.current = null;
         remoteAnalyserRef.current = null;
+      });
+      room.on(RoomEvent.AudioPlaybackStatusChanged, (canPlay) => {
+        if (roomRef.current !== room) return;
+        setAudioPlaybackStatus(canPlay
+          ? remoteAudioElementRef.current?.srcObject ? "ready" : "waiting"
+          : "blocked");
       });
       room.on(RoomEvent.Disconnected, () => {
         if (roomRef.current !== room) return;
@@ -621,12 +642,30 @@ export default function Home() {
     }
   }
 
+  async function resumeRemoteAudio() {
+    const room = roomRef.current;
+    const audioElement = remoteAudioElementRef.current;
+    try {
+      await audioContextRef.current?.resume();
+      await room?.startAudio();
+      if (audioElement?.srcObject) {
+        audioElement.muted = false;
+        audioElement.volume = 1;
+        await audioElement.play();
+        setAudioPlaybackStatus("ready");
+      } else if (room) {
+        setAudioPlaybackStatus("waiting");
+      }
+    } catch (error) {
+      setAudioPlaybackStatus((error as Error).name === "NotAllowedError" ? "blocked" : "error");
+    }
+  }
+
   function handlePointerDown(event: PointerEvent<HTMLButtonElement>) {
     if ((event.pointerType === "mouse" && event.button !== 0) || activePointerRef.current !== null) return;
     event.preventDefault();
     activePointerRef.current = event.pointerId;
-    void audioContextRef.current?.resume();
-    void remoteAudioElementRef.current?.play().catch(() => null);
+    void resumeRemoteAudio();
     if (mediaStatus === "connected" && micTrackRef.current) {
       void setPtt(true);
     } else if (remoteSession && mediaStatus !== "connecting") {
@@ -743,6 +782,12 @@ export default function Home() {
 
   if (activeDevice && remoteSession && !showDevicePicker) {
     const replyActive = !talking && Math.max(...waveLevels) > 0.08;
+    const connectionStatus = mediaStatus === "connected"
+      ? audioPlaybackStatus === "blocked" ? "已连接 · 音频播放受限"
+        : audioPlaybackStatus === "error" ? "已连接 · 音频播放失败"
+          : audioPlaybackStatus === "ready" ? "已连接 · 音频回传已就绪"
+            : "已连接 · 等待 GPT 音频"
+      : mediaStatus === "connecting" ? "正在恢复连接" : "连接已中断 · 按住说话重连";
     return (
       <main className="shell session-shell">
         <header className="session-header">
@@ -750,10 +795,10 @@ export default function Home() {
             <Laptop /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
           </button>
           <div className="session-actions">
-            <button className="icon-button" type="button" onClick={() => { void audioContextRef.current?.resume(); void remoteAudioElementRef.current?.play().catch(() => null); }} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
+            <button className={`icon-button ${audioPlaybackStatus === "blocked" || audioPlaybackStatus === "error" ? "attention" : ""}`} type="button" onClick={() => void resumeRemoteAudio()} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
           </div>
         </header>
-        <p className="connection-line"><span className={mediaStatus === "connected" ? "online-dot" : "offline-dot"} /> {mediaStatus === "connected" ? "已连接 · 控制通道正常" : mediaStatus === "connecting" ? "正在恢复连接" : "连接已中断 · 按住说话重连"}</p>
+        <p className="connection-line"><span className={mediaStatus === "connected" ? "online-dot" : "offline-dot"} /> {connectionStatus}</p>
         <section className="voice-stage">
           <div
             className="transcript-list"

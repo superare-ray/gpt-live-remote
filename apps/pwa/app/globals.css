@@ -57,6 +57,7 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .icon-button svg { width: 20px; height: 20px; stroke-width: 2; }
 .icon-button:not(:disabled):hover { background: rgba(157,184,163,.08); }
 .icon-button:not(:disabled):active { background: rgba(157,184,163,.14); }
+.icon-button.attention { color: #d7aaa5; }
 .device-list { display: grid; gap: 14px; }
 .device-card { display: grid; grid-template-columns: 58px minmax(0,1fr) auto; align-items: center; gap: 15px; padding: 18px; border-radius: 20px; border: 1px solid var(--border); background: rgba(13,25,19,.86); }
 .device-card.connected { border-color: rgba(120,165,134,.52); background: rgba(18,37,27,.92); }

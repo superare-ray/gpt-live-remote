@@ -167,30 +167,31 @@ function findLastLineIndex(lines: TranscriptLine[], predicate: (line: Transcript
 }
 
 function threadVisibleContent(thread: ThreadDetail): Array<Omit<SessionContent, "order">> {
-  const content: Array<Omit<SessionContent, "order">> = [];
-  let previousInput: string | null = null;
+  const content = new Map<string, Omit<SessionContent, "order">>();
+  const upsert = (entry: Omit<SessionContent, "order">) => content.set(entry.id, entry);
+  let previousInput: { id: string; text: string } | null = null;
   for (const turn of thread.turns || []) {
     for (const item of turn.items || []) {
       const delegation = realtimeDelegation(item);
       if (!delegation) {
-        content.push(...visibleContent(item));
+        visibleContent(item).forEach(upsert);
         continue;
       }
 
       if (previousInput) {
-        const currentIsNew = Boolean(delegation.input && delegation.source !== "transcript_tail_flush" && !sameSpeech(delegation.input, previousInput));
+        const currentIsNew = Boolean(delegation.input && delegation.source !== "transcript_tail_flush" && !sameSpeech(delegation.input, previousInput.text));
         const currentBoundary = currentIsNew
           ? findLastLineIndex(delegation.transcript, (line) => line.role === "user" && sameSpeech(line.text, delegation.input!))
           : delegation.transcript.length;
         const boundary = currentBoundary >= 0 ? currentBoundary : delegation.transcript.length;
         const previousIndex = findLastLineIndex(delegation.transcript, (line, index) => (
-          index < boundary && line.role === "user" && sameSpeech(line.text, previousInput!)
+          index < boundary && line.role === "user" && sameSpeech(line.text, previousInput!.text)
         ));
         if (previousIndex >= 0) {
           const assistantText = finalAssistantText(delegation.transcript.slice(previousIndex + 1, boundary));
           if (assistantText) {
-            content.push({
-              id: `${delegation.id}:transcript:assistant`,
+            upsert({
+              id: `${previousInput.id}:transcript:assistant`,
               role: "assistant",
               kind: "text",
               text: assistantText,
@@ -199,18 +200,35 @@ function threadVisibleContent(thread: ThreadDetail): Array<Omit<SessionContent, 
         }
       }
 
-      if (delegation.input && delegation.source !== "transcript_tail_flush" && (!previousInput || !sameSpeech(delegation.input, previousInput))) {
-        content.push({
+      if (delegation.input && delegation.source !== "transcript_tail_flush" && (!previousInput || !sameSpeech(delegation.input, previousInput.text))) {
+        upsert({
           id: `${delegation.id}:transcript:user`,
           role: "user",
           kind: "text",
           text: delegation.input,
         });
-        previousInput = delegation.input;
+        previousInput = { id: delegation.id, text: delegation.input };
+      }
+
+      if (previousInput) {
+        const inputIndex = findLastLineIndex(delegation.transcript, (line) => (
+          line.role === "user" && sameSpeech(line.text, previousInput!.text)
+        ));
+        if (inputIndex >= 0) {
+          const assistantText = finalAssistantText(delegation.transcript.slice(inputIndex + 1));
+          if (assistantText) {
+            upsert({
+              id: `${previousInput.id}:transcript:assistant`,
+              role: "assistant",
+              kind: "text",
+              text: assistantText,
+            });
+          }
+        }
       }
     }
   }
-  return content;
+  return [...content.values()];
 }
 
 function visibleContent(item: ThreadItem): Array<Omit<SessionContent, "order">> {
@@ -239,8 +257,7 @@ export class CodexSessionContentMonitor {
   private reader: AppServerReader | null = null;
   private timer: NodeJS.Timeout | null = null;
   private selectedThreadId: string | null = null;
-  private lastThreadUpdatedAt = 0;
-  private seen = new Set<string>();
+  private published = new Map<string, string>();
   private allContent: SessionContent[] = [];
   private stopped = false;
 
@@ -293,8 +310,6 @@ export class CodexSessionContentMonitor {
     const summaries = await this.listThreads();
     const threadId = await this.findRealtimeThread(summaries);
     if (!threadId) return;
-    const summary = summaries.find((thread) => thread.id === threadId);
-    if (!baseline && summary && summary.updatedAt <= this.lastThreadUpdatedAt) return;
     const thread = await this.readThread(threadId, true);
     if (!thread) return;
     if (this.selectedThreadId !== threadId) {
@@ -305,13 +320,13 @@ export class CodexSessionContentMonitor {
       .map((content, order) => ({ ...content, order }));
     this.allContent = contents;
     for (const content of contents) {
-      if (baseline) this.seen.add(content.id);
-      else if (!this.seen.has(content.id)) {
-        this.seen.add(content.id);
+      const fingerprint = JSON.stringify([content.order, content.role, content.kind, content.text, content.label]);
+      const previousFingerprint = this.published.get(content.id);
+      this.published.set(content.id, fingerprint);
+      if (!baseline && previousFingerprint !== fingerprint) {
         this.onContent(content);
       }
     }
-    this.lastThreadUpdatedAt = summary?.updatedAt || Date.now();
   }
 
   async close() {
