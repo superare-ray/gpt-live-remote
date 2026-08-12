@@ -86,12 +86,14 @@ export default function Home() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const roomRef = useRef<Room | null>(null);
   const micTrackRef = useRef<LocalAudioTrack | null>(null);
+  const remoteAudioElementRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const localAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const remoteAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const localAnalyserRef = useRef<AnalyserNode | null>(null);
   const remoteAnalyserRef = useRef<AnalyserNode | null>(null);
   const talkingRef = useRef(false);
+  const activePointerRef = useRef<number | null>(null);
   const pttQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [waveLevels, setWaveLevels] = useState<WaveLevels>([0, 0, 0]);
 
@@ -104,6 +106,11 @@ export default function Home() {
     remoteAudioSourceRef.current = null;
     localAnalyserRef.current = null;
     remoteAnalyserRef.current = null;
+    const audioElement = remoteAudioElementRef.current;
+    if (audioElement) {
+      audioElement.pause();
+      audioElement.srcObject = null;
+    }
     const context = audioContextRef.current;
     audioContextRef.current = null;
     if (context && context.state !== "closed") await context.close().catch(() => null);
@@ -129,6 +136,22 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const audioElement = document.createElement("audio");
+    audioElement.autoplay = true;
+    audioElement.playsInline = true;
+    audioElement.preload = "auto";
+    audioElement.style.display = "none";
+    document.body.appendChild(audioElement);
+    remoteAudioElementRef.current = audioElement;
+    return () => {
+      if (remoteAudioElementRef.current === audioElement) remoteAudioElementRef.current = null;
+      audioElement.pause();
+      audioElement.srcObject = null;
+      audioElement.remove();
+    };
+  }, []);
+
+  useEffect(() => {
     request<{ user: AuthUser }>("/api/v1/auth/me")
       .then(({ user: current }) => {
         setUser(current);
@@ -144,7 +167,10 @@ export default function Home() {
 
   useEffect(() => {
     const stopTalking = () => {
-      if (document.visibilityState === "hidden" || !document.hasFocus()) void setPtt(false);
+      if (document.visibilityState === "hidden" || !document.hasFocus()) {
+        activePointerRef.current = null;
+        void setPtt(false);
+      }
     };
     document.addEventListener("visibilitychange", stopTalking);
     window.addEventListener("blur", stopTalking);
@@ -294,19 +320,36 @@ export default function Home() {
         const room = new Room({ adaptiveStream: false, dynacast: false });
         room.on(RoomEvent.TrackSubscribed, (track) => {
           if (track.kind !== Track.Kind.Audio) return;
+          const audioElement = remoteAudioElementRef.current;
+          if (audioElement) {
+            track.attach(audioElement);
+            audioElement.muted = false;
+            audioElement.volume = 1;
+            void audioElement.play().catch(() => null);
+          }
           remoteAudioSourceRef.current?.disconnect();
           remoteAnalyserRef.current?.disconnect();
-          const remoteSource = audioContext.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
-          const remoteAnalyser = audioContext.createAnalyser();
-          remoteAnalyser.fftSize = 256;
-          remoteAnalyser.smoothingTimeConstant = 0.72;
-          remoteSource.connect(remoteAnalyser);
-          remoteAnalyser.connect(audioContext.destination);
-          remoteAudioSourceRef.current = remoteSource;
-          remoteAnalyserRef.current = remoteAnalyser;
+          try {
+            const remoteSource = audioContext.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
+            const remoteAnalyser = audioContext.createAnalyser();
+            remoteAnalyser.fftSize = 256;
+            remoteAnalyser.smoothingTimeConstant = 0.72;
+            remoteSource.connect(remoteAnalyser);
+            remoteAudioSourceRef.current = remoteSource;
+            remoteAnalyserRef.current = remoteAnalyser;
+          } catch {
+            remoteAudioSourceRef.current = null;
+            remoteAnalyserRef.current = null;
+          }
         });
         room.on(RoomEvent.TrackUnsubscribed, (track) => {
           if (track.kind !== Track.Kind.Audio) return;
+          const audioElement = remoteAudioElementRef.current;
+          if (audioElement) {
+            track.detach(audioElement);
+            audioElement.pause();
+            audioElement.srcObject = null;
+          }
           remoteAudioSourceRef.current?.disconnect();
           remoteAnalyserRef.current?.disconnect();
           remoteAudioSourceRef.current = null;
@@ -364,20 +407,39 @@ export default function Home() {
     talkingRef.current = active;
     setTalking(active);
     pttQueueRef.current = pttQueueRef.current.then(async () => {
-      await request(`/api/v1/sessions/${remoteSession.id}/ptt`, {
-        method: "POST",
-        body: JSON.stringify({ active }),
-      });
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 4_500);
+      try {
+        await request(`/api/v1/sessions/${remoteSession.id}/ptt`, {
+          method: "POST",
+          body: JSON.stringify({ active }),
+          keepalive: true,
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeout);
+      }
     }).catch(() => setNotice("控制事件发送失败"));
     await pttQueueRef.current;
   }
 
   function handlePointerDown(event: PointerEvent<HTMLButtonElement>) {
-    event.currentTarget.setPointerCapture(event.pointerId);
+    if ((event.pointerType === "mouse" && event.button !== 0) || activePointerRef.current !== null) return;
+    event.preventDefault();
+    activePointerRef.current = event.pointerId;
+    void audioContextRef.current?.resume();
+    void remoteAudioElementRef.current?.play().catch(() => null);
     void setPtt(true);
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // The control request must not depend on browser pointer-capture support.
+    }
   }
 
-  function handlePointerUp() {
+  function handlePointerUp(event?: PointerEvent<HTMLButtonElement>) {
+    if (event && activePointerRef.current !== null && event.pointerId !== activePointerRef.current) return;
+    activePointerRef.current = null;
     void setPtt(false);
   }
 
@@ -441,7 +503,7 @@ export default function Home() {
             <Laptop /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
           </button>
           <div className="session-actions">
-            <button className="session-icon-button" type="button" onClick={() => void audioContextRef.current?.resume()} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
+            <button className="session-icon-button" type="button" onClick={() => { void audioContextRef.current?.resume(); void remoteAudioElementRef.current?.play().catch(() => null); }} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
             <button className="session-icon-button" type="button" onClick={() => setMode(mode === "voice" ? "text" : "voice")} aria-label={mode === "voice" ? "切换到文字" : "切换到语音"} title={mode === "voice" ? "切换到文字" : "切换到语音"}>
               {mode === "voice" ? <Type /> : <Waves />}
             </button>
@@ -454,7 +516,7 @@ export default function Home() {
             <div className={`voice-dots ${talking || replyActive ? "active" : ""}`} aria-hidden>
               {waveLevels.map((level, index) => <i key={index} style={{ height: `${10 + level * 54}px` }} />)}
             </div>
-            <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
+            <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onLostPointerCapture={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
               <Mic />
             </button>
             <p className="helper">松开发送</p>
