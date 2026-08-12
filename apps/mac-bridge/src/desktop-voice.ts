@@ -45,7 +45,7 @@ export function desktopVoiceConfigFromEnv(): DesktopVoiceConfig {
     shortcutKey,
     shortcutModifiers: new Set(shortcutModifiers as Array<"command" | "control" | "option" | "shift">),
     activePattern,
-    timeoutMs: Number(process.env.VOICE_STATE_TIMEOUT_MS || 8_000),
+    timeoutMs: Number(process.env.VOICE_STATE_TIMEOUT_MS || 12_000),
   };
 }
 

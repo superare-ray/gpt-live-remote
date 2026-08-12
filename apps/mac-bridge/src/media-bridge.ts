@@ -82,7 +82,10 @@ export class MacAudioBridge {
   private captureQueue = Promise.resolve();
   private pendingCapture = Buffer.alloc(0);
   private remoteStream: AudioStream | null = null;
+  private remoteTrackSid: string | null = null;
   private closed = false;
+  private phonePeak = 0;
+  private lastPhoneActivityAt = 0;
   private replyPeak = 0;
   private lastReplyActivityAt = 0;
   private previousDefaults: { inputUid: string; outputUid: string } | null = null;
@@ -115,12 +118,25 @@ export class MacAudioBridge {
       const timeout = setTimeout(() => reject(new Error("phone_audio_track_timeout")), 10_000);
       const room = new Room();
       this.room = room;
-      room.on(RoomEvent.TrackSubscribed, (track) => {
-        if (track.kind !== TrackKind.KIND_AUDIO || this.remoteStream) return;
+      room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+        if (track.kind !== TrackKind.KIND_AUDIO) return;
         clearTimeout(timeout);
-        this.remoteStream = new AudioStream(track, { sampleRate, numChannels: channels, frameSizeMs: 10 });
-        void this.pipeRemoteAudio(this.remoteStream);
+        const previousStream = this.remoteStream;
+        const stream = new AudioStream(track, { sampleRate, numChannels: channels, frameSizeMs: 10 });
+        this.remoteStream = stream;
+        this.remoteTrackSid = track.sid || null;
+        void previousStream?.cancel().catch(() => null);
+        void this.pipeRemoteAudio(stream);
+        console.log(`✓ 手机音轨已接入 (${participant.identity})`);
         resolve();
+      });
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        if (track.kind !== TrackKind.KIND_AUDIO || track.sid !== this.remoteTrackSid) return;
+        const stream = this.remoteStream;
+        this.remoteStream = null;
+        this.remoteTrackSid = null;
+        void stream?.cancel().catch(() => null);
+        console.log("◌ 手机音轨已断开，等待重连");
       });
     });
 
@@ -134,7 +150,7 @@ export class MacAudioBridge {
     this.capture = spawn(ffmpegPath, [
       "-hide_banner", "-loglevel", "error", "-thread_queue_size", "512",
       "-f", "avfoundation", "-i", `:${captureIndex}`,
-      "-af", "pan=mono|c0=0.5*c0+0.5*c1",
+      "-af", "pan=mono|c0=0.5*c0+0.5*c1+c2",
       "-ac", String(channels), "-ar", String(sampleRate), "-f", "s16le", "pipe:1",
     ], { stdio: ["pipe", "pipe", "pipe"] });
     waitForExit(this.capture, "BlackHole capture");
@@ -151,12 +167,23 @@ export class MacAudioBridge {
     if (!writer) return;
     try {
       for await (const frame of stream) {
-        if (this.closed) break;
+        if (this.closed || this.remoteStream !== stream) break;
+        const samples = frame.data;
+        for (const sample of samples) this.phonePeak = Math.max(this.phonePeak, Math.abs(sample));
+        const now = Date.now();
+        if (this.phonePeak >= 256 && now - this.lastPhoneActivityAt >= 1_000) {
+          const peakDb = (20 * Math.log10(this.phonePeak / 32_768)).toFixed(1);
+          console.log(`🎙 手机上行音频活动：峰值 ${peakDb} dBFS`);
+          this.phonePeak = 0;
+          this.lastPhoneActivityAt = now;
+        } else if (now - this.lastPhoneActivityAt >= 1_000) {
+          this.phonePeak = 0;
+        }
         const bytes = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
         if (!writer.write(bytes)) await once(writer, "drain");
       }
     } catch (error) {
-      if (!this.closed) console.error(`Remote audio playout failed: ${(error as Error).message}`);
+      if (!this.closed && this.remoteStream === stream) console.error(`Remote audio playout failed: ${(error as Error).message}`);
     }
   }
 
@@ -195,6 +222,8 @@ export class MacAudioBridge {
     if (this.closed) return;
     this.closed = true;
     await this.remoteStream?.cancel().catch(() => null);
+    this.remoteStream = null;
+    this.remoteTrackSid = null;
     await Promise.all([stopChild(this.playout), stopChild(this.capture)]);
     this.playout = null;
     this.capture = null;
