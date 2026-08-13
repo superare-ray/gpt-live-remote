@@ -20,14 +20,12 @@ import {
   VolumeX,
   Waves,
 } from "lucide-react";
-import { FormEvent, PointerEvent as ReactPointerEvent, Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   DeviceSessionRuntime,
   type RuntimeSession as RemoteSession,
   type RuntimeSnapshot,
 } from "./device-session-runtime";
-
-const FluidGlassOverlay = lazy(() => import("./fluid-glass-overlay").then((module) => ({ default: module.FluidGlassOverlay })));
 
 type AuthUser = { id: string; email: string };
 type DeviceKind = "phone" | "tablet" | "macbook" | "macmini";
@@ -875,8 +873,6 @@ export default function Home() {
           {voiceReady && mediaConnected && (
             <div className="voice-controls" ref={voiceControlsRef}>
               <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "正在发送" : "按住说话"} onPointerDown={startTalking} onPointerUp={stopTalking} onPointerCancel={stopTalking} onLostPointerCapture={stopTalking} onContextMenu={(event) => event.preventDefault()}>
-                <span className="ptt-substrate" aria-hidden />
-                <Suspense fallback={null}><FluidGlassOverlay /></Suspense>
                 <span className="ptt-label" aria-hidden>{talking ? "正在发送" : "按住说话"}</span>
               </button>
             </div>
