@@ -33,6 +33,7 @@
 | KI-015 | Bridge 进程存活但设备长期显示离线 | Control WebSocket 1006 后未自愈 | 已知待修复 |
 | KI-016 | 蓝牙断开后声音落到听筒且很小 | 移动系统通信音频路由 | 平台能力边界 |
 | KI-017 | 切换设备必须先停旧设备，且跳离 Live 页 | PWA 单例媒体 runtime/账号单租约 | 已实施待复验 |
+| KI-018 | dropdown 不切页、切回不重启 Voice、设备按钮常驻 loading、静音无效 | PWA 前台切换 / Voice 复核 / 播放状态 | 已实施待复验 |
 
 ## KI-001：子路径发生 308 重定向循环
 
@@ -283,6 +284,33 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 **验证**
 
 - PWA lint/build、Control API typecheck/build、Mac Bridge typecheck/native build 均通过。尚未执行媒体或 Voice 测试，等待用户在两台真实 Mac 与手机上复验。
+
+## KI-018：多设备 dropdown、Voice 恢复、设备 spinner 与静音状态不收敛
+
+**症状**
+
+- Live 页点击另一台 Mac 后 dropdown 仍展开，没有立即显示目标设备。
+- 用户在 Mac 上手动关闭 Codex Voice，切回该设备后页面长期显示“正在连接”，Bridge 没有重新启动 Voice。
+- 返回设备管理页后，已有 session 的“断开连接”按钮持续显示 loading。
+- 点击下行静音后仍能听到远端声音；同 session 遥测持续显示 `playback.muted=false`。
+
+**边界证据与根因**
+
+- `connectDevice` 在更新 active device 与关闭 dropdown 前 `await` 旧 runtime 的 `setForeground(false)`；其中远端 unsubscribe 是网络异步操作，阻塞了本应同步发生的 UI 选择。
+- 服务器 session 的 `ready` 只代表首次启动已验证。用户在桌面手动关闭 Voice 不会终止 WebRTC，切回旧 runtime 时原实现没有重新检查 `process-io`，因此错误复用旧 ready。
+- 后台 runtime 按设计 unsubscribe 下行，内部 `mediaStatus` 会回到 `connecting`；设备列表把这个媒体细节优先于已存在的服务器 session，错误显示 spinner。
+- 静音只修改 audio element 的 `muted` 属性，轨道 attach/恢复播放路径可能覆盖它；真实遥测没有出现 muted 状态。
+
+**已实施处理**
+
+- 点击设备先同步关闭 dropdown、更新 active device/Live UI，再并行调用旧 runtime 后台化和新 runtime 连接；不再等待旧 unsubscribe 才切 UI。
+- 增加 `POST /sessions/:id/ensure-voice` 与 Bridge `session.ensure_voice`。切回已存在 runtime 时先隐藏 PTT，Bridge 用 CoreAudio process input 幂等复核；已开启则不发送快捷键，已关闭才启动，确认后恢复 PTT。
+- 设备管理以活动 session 判定“已连接”；只有不存在 session 的设备才可因 `mediaStatus=connecting` 显示连接 spinner。
+- 下行静音改为对当前远端 audio element 同时 `muted=true` 与 `pause()`；恢复时才 `play()`，所有 attach/foreground 路径读取同一个持久状态。
+
+**验证**
+
+- 静态检查通过；尚未执行媒体、Voice 或真机交互测试，等待用户在 Mono、Raymond 与手机上复验。
 
 ## 新故障登记流程
 

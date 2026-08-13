@@ -29,6 +29,9 @@
 ### Mac Bridge
 
 - `startAndVerifyVoice` 检测到 Codex 已有真实输入时直接返回 ready，不发送快捷键、不先关闭再重开。
+- runtime 从后台重新成为前台时调用幂等 `ensure_voice`；Bridge 重新检查真实 CoreAudio 输入，用户手动关闭 Voice 后才重新触发快捷键，确认前隐藏 PTT。
+- 设备 dropdown 点击先同步切换 Live UI，再并行后台化旧 runtime；设备管理页已连接状态不再被后台 unsubscribe 的内部 connecting 状态覆盖。
+- 下行静音同时暂停实际远端 audio element，重新 attach、订阅和前后台切换都持续继承静音状态。
 - 每台 Mac 仍只允许一个 Bridge session；本次并行是账号跨设备并行，不允许同一 Bridge 多 session。
 
 ## 验证状态

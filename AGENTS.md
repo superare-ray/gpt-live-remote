@@ -54,7 +54,7 @@
 
 - 浏览器为每台已连接设备建立一个独立 runtime；每个 runtime 只拥有一个 `LocalAudioTrack`、一个 LiveKit `Room`、一个 `AudioContext`、一个远端 audio element，以及对应 analyser、计时器和控制 WebSocket。资源不得跨设备复用或由全局单例覆盖。
 - 设备连接时一次性授权麦克风、创建并发布轨道。连接期间 WebRTC 房间和轨道常驻；按住说话只 `unmute`，松开只 `mute`，不得 stop、unpublish、重建轨道、重协商或重启 Bridge 输出。
-- 切换 A→B 时立即把 Live 页目标改为 B 并显示“正在连接”；A runtime 保持但必须先 mute 本地轨道、unsubscribe 远端轨道并停止 audio element，B 成为唯一前台音频 runtime。只有 B 上行已发布且下行已订阅才显示音频“已连接”；只有 Codex Voice 状态 ready 后才显示 PTT。
+- 切换 A→B 的点击必须先同步关闭 dropdown、把 Live 页目标改为 B 并显示“正在连接”，再并行执行 A 的后台化和 B 的连接；不得等待 A 的 `setSubscribed(false)` 网络操作后才更新 UI。A runtime 保持但立即进入 foreground=false、mute 本地轨道、unsubscribe 远端轨道并停止 audio element，B 成为唯一前台音频 runtime。只有 B 上行已发布且下行已订阅才显示音频“已连接”；只有重新确认 Codex Voice 状态 ready 后才显示 PTT。
 - 网络异常的自动媒体重连只属于当前 Live 页设备；离开 Live 页、切换到其他设备、用户明确断开、权限失败或15分钟空闲回收都不得自动重连。
 - 控制 WebSocket 非终止性断开时只重连控制面。关闭码或服务器状态明确表示会话终止时，才释放媒体面。
 - 明确断开、终止性 Room 关闭或服务器判定会话结束时，必须成对执行：停止 PTT → unpublish → Room disconnect → track stop → analyser disconnect → AudioContext close → audio detach → 清理 heartbeat、stats 与 reconnect timer。
@@ -81,7 +81,7 @@
 
 - 用户确认的 Voice chat hotkey 是 `Control+Shift+V`。Bridge 必须通过原生 CoreGraphics HID `send-hotkey` 触发，禁止使用 AppleScript `keystroke`，禁止回退到切换 Chat、创建新任务或 `Command+N`。
 - Voice 是否真正启动以 `audio-device.swift process-io com.openai.codex` 的 CoreAudio 输入状态为准，不以窗口标题、启动音、UI 波形或“是否主动打招呼”为准。
-- 启动请求发现 Codex Voice 已有真实 CoreAudio 输入时必须直接复用，不发送快捷键、不先关闭再重开；Bridge 对同一 session 的重复 start 也只回报 ready。
+- 启动请求发现 Codex Voice 已有真实 CoreAudio 输入时必须直接复用，不发送快捷键、不先关闭再重开；Bridge 对同一 session 的重复 start 也只回报 ready。设备 runtime 从后台切回前台时必须发送幂等 `ensure_voice`：再次读取 CoreAudio process input，仍开启则直接确认，用户在 Mac 上手动关闭后才重新触发快捷键；前端等待确认期间不得显示 PTT。
 - 不得重启 Codex。只有在刷新系统音频设备缓存确有必要且用户允许时，才可单独重启 Codex Chromium AudioService helper。
 
 ## 5. 认证、安全与数据边界
@@ -98,11 +98,11 @@
 - 图标按钮无外框、点击反馈一致、图标视觉尺寸一致，不增加单独的“启用音频”页面或按钮。
 - Live 页顶部设备名称只打开在线设备 source dropdown；选择另一设备时立即留在 Live 页显示新设备及“正在连接”，旧 session 不停止。返回设备管理使用独立的回退按钮。
 - 设备管理允许修改账号内设备的显示名称和展示图标；图标固定为手机、Pad、MacBook、Mac mini 四种，只影响 UI，不改变 Bridge 硬件身份、凭据或媒体能力。
-- 浏览器只保留下行静音/恢复按钮；扬声器、听筒与蓝牙的真实路由交由手机系统管理。不得展示目标移动浏览器不能可靠执行的 `selectAudioOutput`/`setSinkId` 伪切换入口。
+- 浏览器只保留下行静音/恢复按钮；静音必须作用于当前 runtime 的实际远端播放元素，并同时 `muted=true` 与 `pause()`，轨道重新 attach/subscribe 和前后台切换不得覆盖该状态；恢复时才允许重新 `play()`。扬声器、听筒与蓝牙的真实路由交由手机系统管理。不得展示目标移动浏览器不能可靠执行的 `selectAudioOutput`/`setSinkId` 伪切换入口。
 - 蓝牙断开后“必须自动回到手机扬声器”是产品目标，但通用移动浏览器无法可靠强制通信音频从听筒切到扬声器。PWA 只能在 `devicechange` 可用时检测变化并提供系统路由指引；若该行为要求零用户操作和跨浏览器保证，必须使用具备原生音频路由 API 的 Android/HarmonyOS 客户端。
 - 不根据音频电平推断并展示“Codex 正在回复”等状态；居中的三点指示器只表达当前真实音频电平，PTT 只显示“按住说话”或“正在发送”。
 - 麦克风未授权、拒绝或授权等待超时必须与媒体连接超时区分；先回收失败 session，再由新的用户手势重新请求权限，成功后创建全新的正式会话。
-- 已连接设备显示“已连接”并可断开；用户主动断开不显示“连接已断开，请重新连接设备”。刷新或恢复后仍停留在与服务器真实会话相符的页面。
+- 已连接设备显示“已连接”并可断开；设备管理页以服务器 session 是否存在判定该状态，不能把后台 runtime 因下行 unsubscribe 产生的内部 `mediaStatus=connecting` 显示为连接 spinner。用户主动断开不显示“连接已断开，请重新连接设备”。刷新或恢复后仍停留在与服务器真实会话相符的页面。
 - 面向普通用户只显示可行动的连接/权限/播放错误，不展示内部协议、计数器或诊断噪声。
 
 ## 7. 可观测性与诊断纪律

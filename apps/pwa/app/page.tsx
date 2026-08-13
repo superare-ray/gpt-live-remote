@@ -299,7 +299,9 @@ export default function Home() {
     setSnapshots((current) => ({ ...current, [device.id]: runtime.snapshot() }));
     try {
       await runtime.connect();
-      const ready = session.status === "ready" ? session : await waitForSessionReady(session.id);
+      const ready = session.status === "ready"
+        ? await request<{ ok: true }>(`/api/v1/sessions/${session.id}/ensure-voice`, { method: "POST", body: "{}" }).then(() => session)
+        : await waitForSessionReady(session.id);
       runtime.updateSession(ready);
       setSession(device.id, ready);
       if (activeDeviceIdRef.current === device.id) {
@@ -321,8 +323,10 @@ export default function Home() {
       setTalking(false);
       activePointerRef.current = null;
       clearReconnect(previousId);
-      await runtimesRef.current.get(previousId)?.setForeground(false);
+      void runtimesRef.current.get(previousId)?.setForeground(false);
     }
+    // Selection is a synchronous UI action. Media handoff continues after the
+    // Live page has already switched to the chosen device.
     activeDeviceIdRef.current = device.id;
     showDeviceManagerRef.current = false;
     setActiveDevice(device);
@@ -334,16 +338,32 @@ export default function Home() {
     window.localStorage.setItem(lastLiveDeviceKey, device.id);
     unlockRemoteAudioFromGesture();
 
-    const existingRuntime = runtimesRef.current.get(device.id);
-    if (existingRuntime) {
-      existingRuntime.setOutputMuted(audioOutputMuted);
-      await existingRuntime.setForeground(true);
-      setConnectingId(null);
-      setNotice(null);
+    const pending = connectionPromisesRef.current.get(device.id);
+    if (pending) {
+      await pending;
+      const pendingRuntime = runtimesRef.current.get(device.id);
+      if (pendingRuntime && activeDeviceIdRef.current === device.id && !showDeviceManagerRef.current) {
+        await pendingRuntime.setForeground(true);
+      }
       return;
     }
-    const pending = connectionPromisesRef.current.get(device.id);
-    if (pending) return pending;
+    const existingRuntime = runtimesRef.current.get(device.id);
+    if (existingRuntime) {
+      try {
+        existingRuntime.setOutputMuted(audioOutputMuted);
+        existingRuntime.setVoiceReady(false);
+        await existingRuntime.setForeground(true);
+        await request<{ ok: true }>(`/api/v1/sessions/${existingRuntime.session.id}/ensure-voice`, { method: "POST", body: "{}" });
+        existingRuntime.setVoiceReady(true);
+        if (activeDeviceIdRef.current === device.id) setNotice(null);
+      } catch (error) {
+        existingRuntime.setVoiceReady(false);
+        if (activeDeviceIdRef.current === device.id) setNotice((error as Error).message);
+      } finally {
+        setConnectingId((current) => current === device.id ? null : current);
+      }
+      return;
+    }
 
     const operation = (async () => {
       let session: RemoteSession | null = null;
@@ -387,6 +407,7 @@ export default function Home() {
         }
       } finally {
         connectionPromisesRef.current.delete(device.id);
+        setConnectingId((current) => current === device.id ? null : current);
       }
     })();
     connectionPromisesRef.current.set(device.id, operation);
@@ -828,7 +849,7 @@ export default function Home() {
         {devices.map((device) => {
           const connected = Boolean(sessions[device.id]);
           const snapshot = snapshots[device.id];
-          const connecting = connectingId === device.id || snapshot?.mediaStatus === "connecting";
+          const connecting = !connected && (connectingId === device.id || snapshot?.mediaStatus === "connecting");
           return (
             <article className={`device-card ${connected ? "connected" : ""}`} key={device.id}>
               <button className="device-card-target" type="button" disabled={!connected && device.status !== "online"} onClick={() => selectManagedDevice(device)} aria-label={connected ? `打开 ${device.name} 当前会话` : `连接 ${device.name}`}>

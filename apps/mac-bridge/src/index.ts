@@ -14,6 +14,7 @@ type ServerMessage =
   | { type: "bridge.heartbeat.ack"; at: number }
   | { type: "pairing.request"; requestId: string; email: string; confirmationCode: string }
   | { type: "session.start"; sessionId: string; media?: { url: string; token: string } | null }
+  | { type: "session.ensure_voice"; sessionId: string }
   | { type: "session.stop"; sessionId: string };
 
 const apiBase = process.env.CONTROL_API_BASE?.replace(/\/$/, "");
@@ -80,6 +81,7 @@ const socket = new WebSocket(wsUrl, {
 let heartbeat: NodeJS.Timeout | null = null;
 let activeMedia: MacAudioBridge | null = null;
 let activeSessionId: string | null = null;
+let voiceStartedForActiveSession = false;
 let sessionTransition = Promise.resolve();
 let shuttingDown = false;
 
@@ -99,6 +101,7 @@ async function shutdown(exitCode: number, reason: string) {
     await stopAndVerifyVoice(desktopVoiceConfigFromEnv()).catch((error) => console.error(`Voice 清理失败：${error.message}`));
   }
   activeSessionId = null;
+  voiceStartedForActiveSession = false;
   if (socket.readyState === WebSocket.OPEN) socket.close(1000, reason);
   readline.close();
   process.exitCode = exitCode;
@@ -131,7 +134,6 @@ socket.on("message", async (raw) => {
       console.log("  正在启动 Codex Voice 并验证音频输入状态…");
       let media: MacAudioBridge | null = null;
       let voiceStartAttempted = false;
-      let voiceStartedForSession = false;
       try {
         if (!message.media?.url || !message.media.token) throw new Error("media_credentials_missing");
         if (activeSessionId === message.sessionId && activeMedia) {
@@ -145,15 +147,17 @@ socket.on("message", async (raw) => {
           await stopAndVerifyVoice(desktopVoiceConfigFromEnv());
         }
         activeSessionId = null;
+        voiceStartedForActiveSession = false;
         if (shuttingDown) throw new Error("bridge_shutting_down");
         media = new MacAudioBridge((reason) => {
           sessionTransition = sessionTransition.then(async () => {
             if (activeMedia !== media) return;
             activeMedia = null;
-            if (activeSessionId === message.sessionId && voiceStartedForSession && process.env.MEDIA_ONLY_MODE !== "true") {
+            if (activeSessionId === message.sessionId && voiceStartedForActiveSession && process.env.MEDIA_ONLY_MODE !== "true") {
               await stopAndVerifyVoice(desktopVoiceConfigFromEnv()).catch(() => null);
             }
             activeSessionId = null;
+            voiceStartedForActiveSession = false;
             sendServer({ type: "session.failed", sessionId: message.sessionId, reason });
           });
         });
@@ -170,8 +174,8 @@ socket.on("message", async (raw) => {
         const config = desktopVoiceConfigFromEnv();
         voiceStartAttempted = true;
         const voice = await startAndVerifyVoice(config);
-        voiceStartedForSession = !voice.alreadyActive;
-        voiceStartAttempted = voiceStartedForSession;
+        voiceStartedForActiveSession = !voice.alreadyActive;
+        voiceStartAttempted = voiceStartedForActiveSession;
         console.log(`[audio][${message.sessionId}][codex.input] ${JSON.stringify({ active: voice.audio.input, pids: voice.audio.pids })}`);
         activeSessionId = message.sessionId;
         console.log("✓ Codex Voice 音频输入已验证\n");
@@ -185,7 +189,31 @@ socket.on("message", async (raw) => {
           await stopAndVerifyVoice(desktopVoiceConfigFromEnv()).catch(() => null);
         }
         activeSessionId = null;
+        voiceStartedForActiveSession = false;
         sendServer({ type: "session.failed", sessionId: message.sessionId, reason });
+      }
+    });
+    await sessionTransition;
+  } else if (message.type === "session.ensure_voice") {
+    sessionTransition = sessionTransition.then(async () => {
+      if (shuttingDown) return;
+      if (activeSessionId !== message.sessionId || !activeMedia) {
+        sendServer({ type: "session.voice.failed", sessionId: message.sessionId, reason: "media_session_not_active" });
+        return;
+      }
+      if (process.env.MEDIA_ONLY_MODE === "true") {
+        sendServer({ type: "session.voice.ready", sessionId: message.sessionId });
+        return;
+      }
+      try {
+        const voice = await startAndVerifyVoice(desktopVoiceConfigFromEnv());
+        if (!voice.alreadyActive) voiceStartedForActiveSession = true;
+        console.log(`[audio][${message.sessionId}][codex.input.ensure] ${JSON.stringify({ active: voice.audio.input, pids: voice.audio.pids, alreadyActive: Boolean(voice.alreadyActive) })}`);
+        sendServer({ type: "session.voice.ready", sessionId: message.sessionId });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "voice_audio_input_unverified";
+        console.error(`✗ Codex Voice 状态恢复未确认：${reason}\n`);
+        sendServer({ type: "session.voice.failed", sessionId: message.sessionId, reason });
       }
     });
     await sessionTransition;
@@ -204,12 +232,14 @@ socket.on("message", async (raw) => {
           await stopAndVerifyVoice(desktopVoiceConfigFromEnv());
         }
         activeSessionId = null;
+        voiceStartedForActiveSession = false;
         console.log("✓ 媒体链路与 Codex Voice 已关闭\n");
         sendServer({ type: "session.stopped", sessionId: message.sessionId });
       } catch (error) {
         const reason = error instanceof Error ? error.message : "desktop_stop_failed";
         activeMedia = null;
         activeSessionId = null;
+        voiceStartedForActiveSession = false;
         if (process.env.MEDIA_ONLY_MODE !== "true") {
           await stopAndVerifyVoice(desktopVoiceConfigFromEnv()).catch(() => null);
         }

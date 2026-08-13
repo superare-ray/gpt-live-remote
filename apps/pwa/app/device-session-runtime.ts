@@ -89,6 +89,7 @@ export class DeviceSessionRuntime {
   private outputMuted: boolean;
   private localPublished = false;
   private remoteSubscribed = false;
+  private voiceReady = false;
   private mediaStatus: RuntimeMediaStatus = "connecting";
   private playbackStatus: RuntimePlaybackStatus = "idle";
   private failure: string | null = null;
@@ -111,7 +112,7 @@ export class DeviceSessionRuntime {
       session: this.session,
       mediaStatus: this.mediaStatus,
       playbackStatus: this.playbackStatus,
-      voiceReady: this.session.status === "ready",
+      voiceReady: this.voiceReady,
       failure: this.failure,
     };
   }
@@ -314,6 +315,11 @@ export class DeviceSessionRuntime {
     audio.muted = !this.foreground || this.outputMuted;
     audio.volume = 1;
     this.playbackStatus = "waiting";
+    if (this.outputMuted || !this.foreground) {
+      audio.pause();
+      this.emit();
+      return;
+    }
     void Promise.all([this.room?.startAudio(), audio.play()].filter(Boolean) as Promise<unknown>[])
       .then(() => {
         if (!this.foreground || this.closing) return;
@@ -371,8 +377,14 @@ export class DeviceSessionRuntime {
     this.statsTimer = window.setInterval(() => void report(), 2_000);
   }
 
-  updateSession(session: RuntimeSession) {
+  updateSession(session: RuntimeSession, voiceReady = session.status === "ready") {
     this.session = session;
+    this.voiceReady = voiceReady;
+    this.emit();
+  }
+
+  setVoiceReady(ready: boolean) {
+    this.voiceReady = ready;
     this.emit();
   }
 
@@ -399,15 +411,19 @@ export class DeviceSessionRuntime {
 
   setOutputMuted(muted: boolean) {
     this.outputMuted = muted;
-    if (this.audioElement) this.audioElement.muted = muted || !this.foreground;
+    if (this.audioElement) {
+      this.audioElement.muted = muted || !this.foreground;
+      if (muted) this.audioElement.pause();
+    }
     if (!muted && this.foreground) void this.resumePlayback();
+    this.emit();
   }
 
   async resumePlayback() {
     const operations: Promise<unknown>[] = [];
     if (this.audioContext) operations.push(this.audioContext.resume());
     if (this.room) operations.push(this.room.startAudio());
-    if (this.audioElement?.srcObject) {
+    if (this.audioElement?.srcObject && !this.outputMuted && this.foreground) {
       this.audioElement.muted = this.outputMuted || !this.foreground;
       this.audioElement.volume = 1;
       operations.push(this.audioElement.play());

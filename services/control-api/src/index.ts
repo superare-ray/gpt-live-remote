@@ -166,6 +166,8 @@ type BridgeMessage =
   | { type: "session.failed"; sessionId: string; reason?: string }
   | { type: "session.stopped"; sessionId: string }
   | { type: "session.stop_failed"; sessionId: string; reason?: string }
+  | { type: "session.voice.ready"; sessionId: string }
+  | { type: "session.voice.failed"; sessionId: string; reason?: string }
   | { type: "session.content"; sessionId: string; content: SessionContent }
   | { type: "session.content.history"; sessionId: string; items: SessionContent[]; nextCursor: string | null };
 type PhoneControlMessage =
@@ -181,8 +183,21 @@ await app.register(websocket);
 const bridgeSockets = new Map<string, WebSocket>();
 const phoneSessionSockets = new Map<string, Set<WebSocket>>();
 const sessionReleaseTimers = new Map<string, NodeJS.Timeout>();
+const voiceEnsureRequests = new Map<string, {
+  deviceId: string;
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}>();
 const sessionVoiceIdleMs = 15 * 60_000;
 const sessionStopWaitAttempts = 24;
+const voiceFailureMessages: Record<string, string> = {
+  accessibility_permission_missing: "Mac Bridge 缺少辅助功能权限",
+  chatgpt_app_not_found: "Mac 上未找到支持 Voice 的 Codex Desktop",
+  voice_audio_input_unverified: "Codex Live 启动未确认",
+  voice_ensure_timeout: "Codex Live 启动确认超时",
+};
 const now = () => Date.now();
 const hmac = (value: string) => createHmac("sha256", env.COOKIE_SECRET).update(value).digest("hex");
 const randomToken = (bytes = 32) => randomBytes(bytes).toString("base64url");
@@ -212,6 +227,30 @@ function closePhoneSessionSockets(sessionId: string, reason: string) {
   }
 }
 
+function settleVoiceEnsure(sessionId: string, error?: Error) {
+  const pending = voiceEnsureRequests.get(sessionId);
+  if (!pending) return;
+  voiceEnsureRequests.delete(sessionId);
+  clearTimeout(pending.timer);
+  if (error) pending.reject(error);
+  else pending.resolve();
+}
+
+function ensureSessionVoice(sessionId: string, deviceId: string, socket: WebSocket) {
+  const existing = voiceEnsureRequests.get(sessionId);
+  if (existing) return existing.promise;
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  const timer = setTimeout(() => settleVoiceEnsure(sessionId, new Error("voice_ensure_timeout")), 15_000);
+  voiceEnsureRequests.set(sessionId, { deviceId, promise, resolve, reject, timer });
+  socket.send(JSON.stringify({ type: "session.ensure_voice", sessionId }));
+  return promise;
+}
+
 function clearSessionRelease(sessionId: string) {
   const timer = sessionReleaseTimers.get(sessionId);
   if (timer) clearTimeout(timer);
@@ -220,6 +259,7 @@ function clearSessionRelease(sessionId: string) {
 
 function markSessionStopped(sessionId: string, deviceId: string, notifyBridge: boolean, closeReason = "session ended") {
   clearSessionRelease(sessionId);
+  settleVoiceEnsure(sessionId, new Error("session_ended"));
   const changed = db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE id = ? AND status IN ('starting', 'ready', 'stopping')")
     .run(sessionId);
   if (changed.changes) closePhoneSessionSockets(sessionId, closeReason);
@@ -471,7 +511,16 @@ app.get("/api/v1/bridge/ws", { websocket: true }, (socket, request) => {
             device.id,
           );
         clearSessionRelease(message.sessionId);
+        settleVoiceEnsure(message.sessionId, new Error(message.type === "session.stopped" ? "session_ended" : "desktop_stop_failed"));
         if (message.type === "session.stopped") closePhoneSessionSockets(message.sessionId, "session ended");
+      } else if (message.type === "session.voice.ready" || message.type === "session.voice.failed") {
+        const active = db.prepare("SELECT id FROM remote_sessions WHERE id = ? AND device_id = ? AND status = 'ready'")
+          .get(message.sessionId, device.id);
+        if (!active) return;
+        settleVoiceEnsure(
+          message.sessionId,
+          message.type === "session.voice.failed" ? new Error(message.reason || "voice_audio_input_unverified") : undefined,
+        );
       } else if (message.type === "session.content") {
         const parsed = z.object({
           type: z.literal("session.content"),
@@ -510,6 +559,9 @@ app.get("/api/v1/bridge/ws", { websocket: true }, (socket, request) => {
   socket.on("close", () => {
     if (bridgeSockets.get(device.id) !== socket) return;
     bridgeSockets.delete(device.id);
+    for (const [sessionId, pending] of voiceEnsureRequests) {
+      if (pending.deviceId === device.id) settleVoiceEnsure(sessionId, new Error("bridge_offline"));
+    }
     const activeSessions = db.prepare("SELECT id FROM remote_sessions WHERE device_id = ? AND status IN ('starting', 'ready')")
       .all(device.id) as Array<{ id: string }>;
     db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE device_id = ? AND status IN ('starting', 'ready')").run(device.id);
@@ -713,6 +765,26 @@ app.get("/api/v1/sessions/:id", async (request, reply) => {
   const session = db.prepare("SELECT id, device_id as deviceId, status, failure_reason as failureReason FROM remote_sessions WHERE id = ? AND user_id = ?").get(id.data, user.id);
   if (!session) return reply.code(404).send({ error: "找不到会话" });
   return { session };
+});
+
+app.post("/api/v1/sessions/:id/ensure-voice", async (request, reply) => {
+  const user = requireUser(request, reply);
+  if (!user) return;
+  const id = z.string().uuid().safeParse((request.params as { id?: string }).id);
+  if (!id.success) return reply.code(400).send({ error: "会话信息无效" });
+  const session = db.prepare("SELECT id, device_id FROM remote_sessions WHERE id = ? AND user_id = ? AND status = 'ready'")
+    .get(id.data, user.id) as { id: string; device_id: string } | undefined;
+  if (!session) return reply.code(409).send({ error: "会话尚未就绪" });
+  const socket = bridgeSockets.get(session.device_id);
+  if (!socket || socket.readyState !== 1) return reply.code(409).send({ error: "Mac Bridge 当前不在线" });
+  try {
+    await ensureSessionVoice(session.id, session.device_id, socket);
+    return { ok: true };
+  } catch (error) {
+    const reason = (error as Error).message;
+    const userMessage = voiceFailureMessages[reason] || (reason === "bridge_offline" ? "Mac Bridge 当前不在线" : "Codex Live 启动未确认");
+    return reply.code(409).send({ error: userMessage });
+  }
 });
 
 app.get("/api/v1/sessions/:id/ws", { websocket: true }, (socket, request) => {
