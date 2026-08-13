@@ -2,6 +2,7 @@
 
 import {
   ArrowLeft,
+  Check,
   ChevronDown,
   Laptop,
   LoaderCircle,
@@ -35,6 +36,13 @@ type RemoteSession = {
 };
 type WaveLevels = [number, number, number];
 type AudioPlaybackStatus = "idle" | "waiting" | "ready" | "blocked" | "error";
+type MicrophoneRecovery = { device: Device; message: string };
+type SelectableMediaDevices = MediaDevices & {
+  selectAudioOutput?: (options?: { deviceId?: string }) => Promise<MediaDeviceInfo>;
+};
+type SinkSelectableAudio = HTMLAudioElement & {
+  setSinkId?: (deviceId: string) => Promise<void>;
+};
 type ClientMediaStage =
   | "microphone_published"
   | "ptt_unmute_requested"
@@ -47,6 +55,11 @@ type ClientMediaStage =
   | "playback_blocked"
   | "playback_error";
 const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
+const microphoneConstraints: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
 const sessionFailureMessages: Record<string, string> = {
   voice_shortcut_not_configured: "Mac 尚未配置 Voice 快捷键",
   voice_shortcut_modifiers_invalid: "Mac 的 Voice 快捷键配置无效",
@@ -97,6 +110,13 @@ function DeviceIcon({ kind }: { kind: Device["kind"] }) {
   return kind === "macmini" ? <Square aria-hidden /> : <Laptop aria-hidden />;
 }
 
+function isMicrophoneAccessError(error: unknown) {
+  const candidate = error as { name?: string; message?: string };
+  return candidate.name === "NotAllowedError"
+    || candidate.name === "SecurityError"
+    || /麦克风连接超时|permission|denied|not allowed/i.test(candidate.message || "");
+}
+
 export default function Home() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [email, setEmail] = useState("");
@@ -109,7 +129,13 @@ export default function Home() {
   const [disconnecting, setDisconnecting] = useState(false);
   const [activeDevice, setActiveDevice] = useState<Device | null>(null);
   const [remoteSession, setRemoteSession] = useState<RemoteSession | null>(null);
-  const [showDevicePicker, setShowDevicePicker] = useState(false);
+  const [showDeviceManager, setShowDeviceManager] = useState(false);
+  const [deviceMenuOpen, setDeviceMenuOpen] = useState(false);
+  const [microphoneRecovery, setMicrophoneRecovery] = useState<MicrophoneRecovery | null>(null);
+  const [requestingMicrophone, setRequestingMicrophone] = useState(false);
+  const [selectingAudioOutput, setSelectingAudioOutput] = useState(false);
+  const [audioOutputLabel, setAudioOutputLabel] = useState("跟随手机系统");
+  const [audioOutputHint, setAudioOutputHint] = useState<string | null>(null);
   const [talking, setTalking] = useState(false);
   const [replying, setReplying] = useState(false);
   const [mediaStatus, setMediaStatus] = useState<"idle" | "connecting" | "connected">("idle");
@@ -135,6 +161,8 @@ export default function Home() {
   const mediaStatsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mediaStatsRunningRef = useRef(false);
   const voiceControlsRef = useRef<HTMLDivElement | null>(null);
+  const deviceMenuRef = useRef<HTMLDivElement | null>(null);
+  const intentionalSessionEndRef = useRef<string | null>(null);
   const mediaConnectionAttemptRef = useRef(0);
   const [waveLevels, setWaveLevels] = useState<WaveLevels>([0, 0, 0]);
 
@@ -260,6 +288,22 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (!deviceMenuOpen) return;
+    const closeOnOutsidePress = (event: globalThis.PointerEvent) => {
+      if (!deviceMenuRef.current?.contains(event.target as Node)) setDeviceMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setDeviceMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePress);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [deviceMenuOpen]);
+
+  useEffect(() => {
     if (!activeDevice || !remoteSession) return;
     let animationFrame = 0;
     let lastUpdate = 0;
@@ -353,8 +397,8 @@ export default function Home() {
             setConnectingId(null);
             setRemoteSession(null);
             setActiveDevice(null);
-            setShowDevicePicker(true);
-            setNotice("连接已断开，请重新连接设备");
+            setShowDeviceManager(true);
+            if (intentionalSessionEndRef.current !== sessionId) setNotice("连接已断开，请重新连接设备");
             void loadDevices();
           });
           return;
@@ -414,24 +458,30 @@ export default function Home() {
     }
   }
 
-  async function stopCurrentSession(propagateError = false) {
+  async function stopCurrentSession(propagateError = false, preserveLiveView = false) {
     if (!remoteSession || disconnecting) return;
+    const endingSessionId = remoteSession.id;
+    intentionalSessionEndRef.current = endingSessionId;
     setDisconnecting(true);
+    setDeviceMenuOpen(false);
     setNotice(null);
     let stopError: Error | null = null;
     try {
-      await request(`/api/v1/sessions/${remoteSession.id}/stop`, { method: "POST", body: "{}" });
+      await request(`/api/v1/sessions/${endingSessionId}/stop`, { method: "POST", body: "{}" });
     } catch (error) {
       stopError = error as Error;
     } finally {
       await disconnectMedia();
       talkingRef.current = false;
       setTalking(false);
-      setRemoteSession(null);
-      setActiveDevice(null);
-      setShowDevicePicker(true);
+      if (!preserveLiveView) {
+        setRemoteSession(null);
+        setActiveDevice(null);
+        setShowDeviceManager(true);
+      }
       await loadDevices().catch(() => null);
       setDisconnecting(false);
+      if (intentionalSessionEndRef.current === endingSessionId) intentionalSessionEndRef.current = null;
     }
     if (stopError) {
       setNotice(stopError.message);
@@ -456,11 +506,7 @@ export default function Home() {
       await audioContext.resume().catch(() => null);
       ensureCurrentAttempt();
       const { createLocalAudioTrack, Room, RoomEvent, Track } = await import("livekit-client");
-      const localMic = await withTimeout(createLocalAudioTrack({
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        }).then((track) => {
+      const localMic = await withTimeout(createLocalAudioTrack(microphoneConstraints).then((track) => {
           if (mediaConnectionAttemptRef.current !== attempt) {
             track.stop();
             throw new Error("连接已取消");
@@ -630,24 +676,34 @@ export default function Home() {
 
   async function activateSession(session: RemoteSession, device: Device) {
     setConnectingId(device.id);
+    setRemoteSession(session);
+    setActiveDevice(device);
+    setShowDeviceManager(false);
     await joinSessionMedia(session);
     const readySession = session.status === "ready" ? session : await waitForSessionReady(session.id);
     setRemoteSession(readySession);
     setActiveDevice(device);
-    setShowDevicePicker(false);
+    setShowDeviceManager(false);
     setConnectingId(null);
     remotePlaybackAllowedRef.current = true;
     resumeRemoteAudio();
   }
 
   async function connectDevice(device: Device) {
+    if (remoteSession?.deviceId === device.id && mediaStatus === "connected") {
+      setDeviceMenuOpen(false);
+      setShowDeviceManager(false);
+      return;
+    }
     unlockRemoteAudioFromGesture();
+    setDeviceMenuOpen(false);
     setConnectingId(device.id);
     setNotice(null);
+    setMicrophoneRecovery(null);
     let createdSession: RemoteSession | null = null;
     if (remoteSession) {
       try {
-        await stopCurrentSession(true);
+        await stopCurrentSession(true, true);
       } catch {
         setConnectingId(null);
         return;
@@ -659,6 +715,7 @@ export default function Home() {
         body: JSON.stringify({ deviceId: device.id }),
       });
       createdSession = result.session;
+      intentionalSessionEndRef.current = null;
       await activateSession(result.session, device);
     } catch (error) {
       if (createdSession) {
@@ -668,8 +725,49 @@ export default function Home() {
       await disconnectMedia();
       setRemoteSession(null);
       setActiveDevice(null);
-      setShowDevicePicker(true);
-      setNotice((error as Error).message);
+      setShowDeviceManager(true);
+      if (isMicrophoneAccessError(error)) {
+        setMicrophoneRecovery({
+          device,
+          message: "需要麦克风权限才能连接。请重新授权后继续。",
+        });
+        setNotice(null);
+      } else {
+        setNotice((error as Error).message);
+      }
+    }
+  }
+
+  async function retryMicrophonePermission() {
+    if (!microphoneRecovery || requestingMicrophone) return;
+    const recovery = microphoneRecovery;
+    setRequestingMicrophone(true);
+    let permissionAttemptExpired = false;
+    try {
+      const stream = await withTimeout(
+        navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints }).then((candidate) => {
+          if (permissionAttemptExpired) {
+            candidate.getTracks().forEach((track) => track.stop());
+            throw new Error("麦克风授权等待超时");
+          }
+          return candidate;
+        }),
+        15_000,
+        "麦克风授权等待超时",
+      );
+      stream.getTracks().forEach((track) => track.stop());
+      setMicrophoneRecovery(null);
+      await connectDevice(recovery.device);
+    } catch (error) {
+      setMicrophoneRecovery({
+        device: recovery.device,
+        message: (error as Error).name === "NotAllowedError"
+          ? "麦克风仍未授权。请在当前网站权限中允许麦克风后再试。"
+          : "未能获得麦克风权限，请确认网站权限后重试。",
+      });
+    } finally {
+      permissionAttemptExpired = true;
+      setRequestingMicrophone(false);
     }
   }
 
@@ -700,6 +798,45 @@ export default function Home() {
       setAudioPlaybackStatus(blocked ? "blocked" : "error");
       reportClientMedia(blocked ? "playback_blocked" : "playback_error", error.name || "user_gesture_resume_failed");
     });
+  }
+
+  async function chooseAudioOutput() {
+    if (selectingAudioOutput) return;
+    setSelectingAudioOutput(true);
+    setNotice(null);
+    setAudioOutputHint(null);
+    resumeRemoteAudio();
+    try {
+      const mediaDevices = navigator.mediaDevices as SelectableMediaDevices;
+      const audioElement = remoteAudioElementRef.current as SinkSelectableAudio | null;
+      if (!mediaDevices.selectAudioOutput || !audioElement?.setSinkId) {
+        setAudioOutputLabel("跟随手机系统");
+        setAudioOutputHint("当前浏览器由手机系统管理音频输出，请从系统音频面板切换扬声器、听筒或蓝牙设备");
+        return;
+      }
+      const selected = await mediaDevices.selectAudioOutput();
+      await audioElement.setSinkId(selected.deviceId);
+      setAudioOutputLabel(selected.label || "已选择音频输出");
+      if (audioElement.srcObject) await audioElement.play();
+    } catch (error) {
+      if ((error as Error).name !== "NotAllowedError") setNotice("音频输出切换失败，请重试");
+    } finally {
+      setSelectingAudioOutput(false);
+    }
+  }
+
+  function toggleDeviceMenu() {
+    setDeviceMenuOpen((open) => {
+      const next = !open;
+      if (next) void loadDevices().catch(() => null);
+      return next;
+    });
+  }
+
+  function openDeviceManager() {
+    setDeviceMenuOpen(false);
+    setShowDeviceManager(true);
+    void loadDevices().catch(() => null);
   }
 
   function startTalking(event: ReactPointerEvent<HTMLButtonElement>) {
@@ -822,7 +959,7 @@ export default function Home() {
           if (device) {
             setRemoteSession(session);
             setActiveDevice(device);
-            setShowDevicePicker(false);
+            setShowDeviceManager(false);
             setConnectingId(device.id);
             setLoading(false);
             try {
@@ -834,7 +971,7 @@ export default function Home() {
                 setConnectingId(null);
                 setRemoteSession(null);
                 setActiveDevice(null);
-                setShowDevicePicker(true);
+                setShowDeviceManager(true);
                 setNotice((error as Error).message);
               }
             }
@@ -844,7 +981,7 @@ export default function Home() {
         if (!cancelled) {
           await disconnectMedia();
           setConnectingId(null);
-          setShowDevicePicker(true);
+          setShowDeviceManager(true);
           setNotice((error as Error).message);
         }
       } finally {
@@ -895,7 +1032,7 @@ export default function Home() {
     );
   }
 
-  if (activeDevice && remoteSession && !showDevicePicker) {
+  if (activeDevice && remoteSession && !showDeviceManager) {
     const replyActive = replying;
     const connectionStatus = mediaStatus === "connected"
       ? audioPlaybackStatus === "blocked" ? "已连接 · 点击扬声器恢复播放"
@@ -906,11 +1043,29 @@ export default function Home() {
     return (
       <main className="shell session-shell">
         <header className="session-header">
-          <button className="device-pill" type="button" onClick={() => setShowDevicePicker(true)}>
-            <Laptop /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
-          </button>
+          <div className="device-selector" ref={deviceMenuRef}>
+            <button className="device-pill" type="button" onClick={toggleDeviceMenu} aria-haspopup="listbox" aria-expanded={deviceMenuOpen}>
+              <DeviceIcon kind={activeDevice.kind} /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
+            </button>
+            {deviceMenuOpen && (
+              <div className="device-dropdown" role="listbox" aria-label="切换音频源">
+                {devices.filter((device) => device.status === "online").map((device) => {
+                  const selected = device.id === activeDevice.id;
+                  return (
+                    <button className="device-option" type="button" role="option" aria-selected={selected} key={device.id} disabled={selected || connectingId !== null || disconnecting} onClick={() => void connectDevice(device)}>
+                      <span className="device-option-icon"><DeviceIcon kind={device.kind} /></span>
+                      <span><strong>{device.name}</strong><small>{selected ? "当前音频源" : "在线"}</small></span>
+                      {selected && <Check aria-hidden />}
+                    </button>
+                  );
+                })}
+                {devices.every((device) => device.status !== "online") && <p className="device-dropdown-empty">暂无在线设备</p>}
+              </div>
+            )}
+          </div>
           <div className="session-actions">
-            <button className={`icon-button ${audioPlaybackStatus === "blocked" || audioPlaybackStatus === "error" ? "attention" : ""}`} type="button" onClick={resumeRemoteAudio} aria-label="音频输出跟随手机系统" title="音频输出跟随手机系统"><Volume2 /></button>
+            <button className="icon-button" type="button" onClick={openDeviceManager} aria-label="返回设备管理" title="返回设备管理"><ArrowLeft /></button>
+            <button className={`icon-button ${audioPlaybackStatus === "blocked" || audioPlaybackStatus === "error" ? "attention" : ""}`} type="button" disabled={selectingAudioOutput} onClick={() => void chooseAudioOutput()} aria-label={`切换音频输出，当前${audioOutputLabel}`} title={`切换音频输出 · ${audioOutputLabel}`}>{selectingAudioOutput ? <LoaderCircle className="spin" /> : <Volume2 />}</button>
           </div>
         </header>
         <p className="connection-line"><span className={mediaStatus === "connected" ? "online-dot" : "offline-dot"} /> {connectionStatus}</p>
@@ -926,7 +1081,8 @@ export default function Home() {
             </button>
           </div>
         </section>
-        {notice && <p className="notice error">{notice}</p>}
+        {audioOutputHint && <p className="notice info session-notice">{audioOutputHint}</p>}
+        {notice && <p className="notice error session-notice">{notice}</p>}
       </main>
     );
   }
@@ -934,9 +1090,9 @@ export default function Home() {
   return (
     <main className="shell devices-shell">
       <header className="title-row">
-        <div><p className="eyebrow">GPT-Live Remote</p><h1>{remoteSession ? "切换设备" : "我的设备"}</h1><p>{remoteSession ? "当前会话会保持连接" : "选择一台设备开始连接"}</p></div>
+        <div><p className="eyebrow">GPT-Live Remote</p><h1>我的设备</h1><p>{remoteSession ? "管理已连接和可用设备" : "选择一台设备开始连接"}</p></div>
         <div className="title-actions">
-          {remoteSession && <button className="icon-button" onClick={() => setShowDevicePicker(false)} aria-label="返回当前会话"><ArrowLeft /></button>}
+          {remoteSession && <button className="icon-button" onClick={() => setShowDeviceManager(false)} aria-label="返回当前会话"><ArrowLeft /></button>}
           <button className="icon-button" onClick={() => void loadDevices()} aria-label="刷新设备"><RefreshCw /></button>
         </div>
       </header>
@@ -959,8 +1115,21 @@ export default function Home() {
         <div className="pair-controls"><input value={pairCode} onChange={(event) => setPairCode(event.target.value)} placeholder="配对码" maxLength={10} required /><button type="submit" disabled={pairing}>{pairing ? <LoaderCircle className="spin" /> : "绑定"}</button></div>
       </form>
       {devices.length === 0 && <div className="empty-state"><Monitor /><strong>还没有已配对的 Mac</strong><span>在 Mac 上启动开发版 Bridge，然后输入它显示的配对码。</span></div>}
-      {notice && <p className="notice error">{notice}</p>}
+      {notice && <p className="notice error devices-notice">{notice}</p>}
       <p className="account-line">已登录 {user.email}</p>
+      {microphoneRecovery && (
+        <div className="permission-backdrop" role="presentation">
+          <section className="permission-dialog" role="dialog" aria-modal="true" aria-labelledby="microphone-permission-title">
+            <div className="permission-icon"><Mic aria-hidden /></div>
+            <h2 id="microphone-permission-title">允许使用麦克风</h2>
+            <p>{microphoneRecovery.message}</p>
+            <div className="permission-actions">
+              <button className="text-button" type="button" onClick={() => setMicrophoneRecovery(null)}>取消</button>
+              <button className="primary" type="button" disabled={requestingMicrophone} onClick={() => void retryMicrophonePermission()}>{requestingMicrophone ? <LoaderCircle className="spin" aria-label="正在请求权限" /> : "重新授权"}</button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
