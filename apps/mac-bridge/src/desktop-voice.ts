@@ -166,10 +166,9 @@ export async function startAndVerifyVoice(config: DesktopVoiceConfig) {
 
   const currentAudio = await readAudioProcessState(config.bundleId);
   if (currentAudio.input) {
-    // Tear down any previous Voice input stream so the next start reacquires
-    // the BlackHole default selected for this remote session.
-    await triggerShortcut(config);
-    await waitForVoiceInput(config, false);
+    // Voice is already active on this Mac. Device switching is a phone-side
+    // routing operation and must not toggle an existing desktop Voice session.
+    return { verified: true, preflight, audio: currentAudio, alreadyActive: true };
   }
   // Chromium's audio utility process can retain the device selected before the
   // Bridge changed the system default. Recreate only that helper (not the app)

@@ -115,22 +115,26 @@ try {
 } catch (error) {
   if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
 }
+try {
+  db.exec("ALTER TABLE remote_sessions ADD COLUMN last_voice_at INTEGER");
+} catch (error) {
+  if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
+}
 
-// A phone account owns one bidirectional media lease at a time. Older databases
-// may already contain one active row per enrolled Mac, so reconcile those rows
-// before installing the persistent uniqueness guard.
+// Each enrolled Mac owns one media lease. An account may keep several Mac
+// sessions alive while the phone selects exactly one foreground audio route.
 db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE status = 'stopping'").run();
 const duplicateActiveSessions = db.prepare(`
-  SELECT id, user_id
+  SELECT id, device_id
   FROM remote_sessions
   WHERE status IN ('starting', 'ready')
-  ORDER BY user_id, created_at DESC, id DESC
-`).all() as Array<{ id: string; user_id: string }>;
+  ORDER BY device_id, created_at DESC, id DESC
+`).all() as Array<{ id: string; device_id: string }>;
 const activeLeaseOwners = new Set<string>();
 const staleActiveSessionIds: string[] = [];
 for (const session of duplicateActiveSessions) {
-  if (activeLeaseOwners.has(session.user_id)) staleActiveSessionIds.push(session.id);
-  else activeLeaseOwners.add(session.user_id);
+  if (activeLeaseOwners.has(session.device_id)) staleActiveSessionIds.push(session.id);
+  else activeLeaseOwners.add(session.device_id);
 }
 if (staleActiveSessionIds.length) {
   const stopStaleSession = db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE id = ? AND status IN ('starting', 'ready')");
@@ -138,10 +142,12 @@ if (staleActiveSessionIds.length) {
   console.warn(`Reconciled ${staleActiveSessionIds.length} duplicate active media lease(s)`);
 }
 db.exec(`
-  CREATE UNIQUE INDEX IF NOT EXISTS remote_sessions_one_active_per_user
-  ON remote_sessions(user_id)
+  DROP INDEX IF EXISTS remote_sessions_one_active_per_user;
+  CREATE UNIQUE INDEX IF NOT EXISTS remote_sessions_one_active_per_device
+  ON remote_sessions(device_id)
   WHERE status IN ('starting', 'ready', 'stopping')
 `);
+db.prepare("UPDATE remote_sessions SET last_voice_at = created_at WHERE last_voice_at IS NULL").run();
 
 type User = { id: string; email: string };
 type SessionContent = {
@@ -175,7 +181,7 @@ await app.register(websocket);
 const bridgeSockets = new Map<string, WebSocket>();
 const phoneSessionSockets = new Map<string, Set<WebSocket>>();
 const sessionReleaseTimers = new Map<string, NodeJS.Timeout>();
-const sessionReconnectGraceMs = 10 * 60_000;
+const sessionVoiceIdleMs = 15 * 60_000;
 const sessionStopWaitAttempts = 24;
 const now = () => Date.now();
 const hmac = (value: string) => createHmac("sha256", env.COOKIE_SECRET).update(value).digest("hex");
@@ -212,63 +218,33 @@ function clearSessionRelease(sessionId: string) {
   sessionReleaseTimers.delete(sessionId);
 }
 
-function markSessionStopped(sessionId: string, deviceId: string, notifyBridge: boolean) {
+function markSessionStopped(sessionId: string, deviceId: string, notifyBridge: boolean, closeReason = "session ended") {
   clearSessionRelease(sessionId);
   const changed = db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE id = ? AND status IN ('starting', 'ready', 'stopping')")
     .run(sessionId);
-  if (changed.changes) closePhoneSessionSockets(sessionId, "session ended");
+  if (changed.changes) closePhoneSessionSockets(sessionId, closeReason);
   if (!changed.changes || !notifyBridge) return;
   const bridge = bridgeSockets.get(deviceId);
   if (bridge?.readyState === 1) bridge.send(JSON.stringify({ type: "session.stop", sessionId }));
 }
 
-type ActiveRemoteSession = {
-  id: string;
-  device_id: string;
-  start_dispatched: number;
-};
-
-async function releaseSessionForReplacement(session: ActiveRemoteSession) {
-  clearSessionRelease(session.id);
-  const claimed = db.prepare("UPDATE remote_sessions SET status = 'stopping' WHERE id = ? AND status IN ('starting', 'ready')").run(session.id);
-  if (!claimed.changes) return;
-  closePhoneSessionSockets(session.id, "session replaced");
-
-  if (!session.start_dispatched) {
-    db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE id = ? AND status = 'stopping'").run(session.id);
-    return;
-  }
-
-  const bridge = bridgeSockets.get(session.device_id);
-  if (!bridge || bridge.readyState !== 1) {
-    // A Bridge tears down its media session when its control socket closes.
-    db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE id = ? AND status = 'stopping'").run(session.id);
-    return;
-  }
-
-  bridge.send(JSON.stringify({ type: "session.stop", sessionId: session.id }));
-  for (let attempt = 0; attempt < sessionStopWaitAttempts; attempt += 1) {
-    await delay(500);
-    const latest = db.prepare("SELECT status, failure_reason FROM remote_sessions WHERE id = ?").get(session.id) as
-      | { status: string; failure_reason: string | null }
-      | undefined;
-    if (!latest || latest.status === "stopped") return;
-    if (latest.status === "stop_failed") throw new Error(latest.failure_reason || "desktop_stop_failed");
-  }
-  db.prepare("UPDATE remote_sessions SET status = 'stop_failed', failure_reason = ? WHERE id = ? AND status = 'stopping'")
-    .run("desktop_stop_timeout", session.id);
-  throw new Error("desktop_stop_timeout");
-}
-
-function scheduleSessionRelease(sessionId: string, deviceId: string) {
+function scheduleSessionRelease(sessionId: string, deviceId: string, lastVoiceAt: number) {
   clearSessionRelease(sessionId);
   const active = db.prepare("SELECT id FROM remote_sessions WHERE id = ? AND status IN ('starting', 'ready')").get(sessionId);
   if (!active) return;
+  const delayMs = Math.max(0, lastVoiceAt + sessionVoiceIdleMs - now());
   sessionReleaseTimers.set(sessionId, setTimeout(() => {
     sessionReleaseTimers.delete(sessionId);
-    if ((phoneSessionSockets.get(sessionId)?.size || 0) > 0) return;
-    markSessionStopped(sessionId, deviceId, true);
-  }, sessionReconnectGraceMs));
+    const latest = db.prepare("SELECT last_voice_at FROM remote_sessions WHERE id = ? AND status IN ('starting', 'ready')")
+      .get(sessionId) as { last_voice_at: number | null } | undefined;
+    if (!latest) return;
+    const latestVoiceAt = latest.last_voice_at || lastVoiceAt;
+    if (latestVoiceAt + sessionVoiceIdleMs > now()) {
+      scheduleSessionRelease(sessionId, deviceId, latestVoiceAt);
+      return;
+    }
+    markSessionStopped(sessionId, deviceId, true, "session idle timeout");
+  }, delayMs));
 }
 
 const sessionContentSchema = z.object({
@@ -458,6 +434,7 @@ app.get("/api/v1/bridge/ws", { websocket: true }, (socket, request) => {
     db.prepare("UPDATE devices SET last_seen = ? WHERE id = ?").run(now(), device.id);
     db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE device_id = ? AND status IN ('starting', 'ready')").run(device.id);
   })();
+  staleSessions.forEach((session) => closePhoneSessionSockets(session.id, "bridge reconnected"));
   socket.send(JSON.stringify({ type: "bridge.hello", deviceId: device.id }));
   socket.on("message", (data: RawData) => {
     try {
@@ -536,7 +513,10 @@ app.get("/api/v1/bridge/ws", { websocket: true }, (socket, request) => {
     const activeSessions = db.prepare("SELECT id FROM remote_sessions WHERE device_id = ? AND status IN ('starting', 'ready')")
       .all(device.id) as Array<{ id: string }>;
     db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE device_id = ? AND status IN ('starting', 'ready')").run(device.id);
-    activeSessions.forEach((session) => clearSessionRelease(session.id));
+    activeSessions.forEach((session) => {
+      clearSessionRelease(session.id);
+      closePhoneSessionSockets(session.id, "bridge offline");
+    });
   });
 });
 
@@ -574,7 +554,7 @@ app.post("/api/v1/pairing/exchange", {
 app.get("/api/v1/devices", async (request, reply) => {
   const user = requireUser(request, reply);
   if (!user) return;
-  const rows = db.prepare("SELECT id, name, kind, last_seen FROM devices WHERE user_id = ? ORDER BY created_at DESC").all(user.id) as Array<{ id: string; name: string; kind: "macbook" | "macmini"; last_seen: number | null }>;
+  const rows = db.prepare("SELECT id, name, kind, last_seen FROM devices WHERE user_id = ? ORDER BY created_at DESC").all(user.id) as Array<{ id: string; name: string; kind: "phone" | "tablet" | "macbook" | "macmini"; last_seen: number | null }>;
   return {
     devices: rows.map((device) => ({
       id: device.id,
@@ -586,6 +566,22 @@ app.get("/api/v1/devices", async (request, reply) => {
   };
 });
 
+app.patch("/api/v1/devices/:id", async (request, reply) => {
+  const user = requireUser(request, reply);
+  if (!user) return;
+  const id = z.string().uuid().safeParse((request.params as { id?: string }).id);
+  if (!id.success) return reply.code(400).send({ error: "设备信息无效" });
+  const parsed = z.object({
+    name: z.string().trim().min(2).max(80),
+    kind: z.enum(["phone", "tablet", "macbook", "macmini"]),
+  }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: "设备名称或图标无效" });
+  const changed = db.prepare("UPDATE devices SET name = ?, kind = ? WHERE id = ? AND user_id = ?")
+    .run(parsed.data.name, parsed.data.kind, id.data, user.id);
+  if (!changed.changes) return reply.code(404).send({ error: "找不到这台设备" });
+  return { device: { id: id.data, ...parsed.data } };
+});
+
 app.post("/api/v1/sessions", async (request, reply) => {
   const user = requireUser(request, reply);
   if (!user) return;
@@ -595,26 +591,47 @@ app.post("/api/v1/sessions", async (request, reply) => {
   if (!device) return reply.code(404).send({ error: "找不到这台设备" });
   const socket = bridgeSockets.get(device.id);
   if (!socket || socket.readyState !== 1) return reply.code(409).send({ error: "Mac Bridge 当前不在线" });
-  const session = { id: randomUUID(), deviceId: device.id, status: "starting" as const };
-  const previousSessions = db.prepare(`
-    SELECT id, device_id, start_dispatched
+  const existing = db.prepare(`
+    SELECT id, device_id as deviceId, status, failure_reason as failureReason,
+           start_dispatched as startDispatched, created_at as createdAt,
+           last_voice_at as lastVoiceAt
     FROM remote_sessions
-    WHERE user_id = ? AND status IN ('starting', 'ready', 'stopping')
-    ORDER BY created_at ASC
-  `).all(user.id) as ActiveRemoteSession[];
-  try {
-    await Promise.all(previousSessions.map(releaseSessionForReplacement));
-  } catch (error) {
-    request.log.error({ error, userId: user.id }, "failed to release previous account media lease");
-    return reply.code(409).send({ error: "上一台 Mac 尚未完全断开，请稍后重试" });
+    WHERE user_id = ? AND device_id = ? AND status IN ('starting', 'ready')
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(user.id, device.id) as {
+    id: string;
+    deviceId: string;
+    status: "starting" | "ready";
+    failureReason: string | null;
+    startDispatched: number;
+    createdAt: number;
+    lastVoiceAt: number | null;
+  } | undefined;
+  if (existing) {
+    const token = await liveKitToken(existing.id, `phone:${user.id}`, "phone");
+    scheduleSessionRelease(existing.id, existing.deviceId, existing.lastVoiceAt || existing.createdAt);
+    return {
+      session: {
+        id: existing.id,
+        deviceId: existing.deviceId,
+        status: existing.status,
+        failureReason: existing.failureReason,
+        media: token ? { url: env.LIVEKIT_URL, token } : null,
+      },
+    };
   }
+
+  const createdAt = now();
+  const session = { id: randomUUID(), deviceId: device.id, status: "starting" as const };
   try {
-    db.prepare("INSERT INTO remote_sessions(id, device_id, user_id, status, created_at) VALUES (?, ?, ?, 'starting', ?)")
-      .run(session.id, device.id, user.id, now());
+    db.prepare("INSERT INTO remote_sessions(id, device_id, user_id, status, created_at, last_voice_at) VALUES (?, ?, ?, 'starting', ?, ?)")
+      .run(session.id, device.id, user.id, createdAt, createdAt);
   } catch (error) {
-    request.log.warn({ error, userId: user.id }, "active media lease already exists");
-    return reply.code(409).send({ error: "另一台设备正在建立连接，请稍后重试" });
+    request.log.warn({ error, userId: user.id, deviceId: device.id }, "device media lease already exists");
+    return reply.code(409).send({ error: "这台设备正在建立连接，请稍后重试" });
   }
+  scheduleSessionRelease(session.id, device.id, createdAt);
   if (!liveKitConfigured) {
     db.prepare("UPDATE remote_sessions SET start_dispatched = 1 WHERE id = ?").run(session.id);
     socket.send(JSON.stringify({ type: "session.start", sessionId: session.id }));
@@ -652,29 +669,40 @@ app.post("/api/v1/sessions/:id/media-ready", async (request, reply) => {
 app.get("/api/v1/sessions/active", async (request, reply) => {
   const user = requireUser(request, reply);
   if (!user) return;
-  const session = db.prepare(`
+  const sessions = db.prepare(`
     SELECT id, device_id as deviceId, status, failure_reason as failureReason,
-           start_dispatched as startDispatched, created_at as createdAt
+           start_dispatched as startDispatched, created_at as createdAt,
+           last_voice_at as lastVoiceAt
     FROM remote_sessions
     WHERE user_id = ? AND status IN ('starting', 'ready')
     ORDER BY created_at DESC
-    LIMIT 1
-  `).get(user.id) as { id: string; deviceId: string; status: "starting" | "ready"; failureReason: string | null; startDispatched: number; createdAt: number } | undefined;
-  if (!session || !bridgeSockets.has(session.deviceId)) return { session: null };
-  if (session.status === "starting" && !session.startDispatched && now() - session.createdAt > 90_000) {
-    db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE id = ? AND status = 'starting'").run(session.id);
-    return { session: null };
-  }
-  const token = await liveKitToken(session.id, `phone:${user.id}`, "phone");
-  return {
-    session: {
+  `).all(user.id) as Array<{
+    id: string;
+    deviceId: string;
+    status: "starting" | "ready";
+    failureReason: string | null;
+    startDispatched: number;
+    createdAt: number;
+    lastVoiceAt: number | null;
+  }>;
+  const active = [];
+  for (const session of sessions) {
+    if (!bridgeSockets.has(session.deviceId)) continue;
+    if (session.status === "starting" && !session.startDispatched && now() - session.createdAt > 90_000) {
+      markSessionStopped(session.id, session.deviceId, false);
+      continue;
+    }
+    const token = await liveKitToken(session.id, `phone:${user.id}`, "phone");
+    scheduleSessionRelease(session.id, session.deviceId, session.lastVoiceAt || session.createdAt);
+    active.push({
       id: session.id,
       deviceId: session.deviceId,
       status: session.status,
       failureReason: session.failureReason,
       media: token ? { url: env.LIVEKIT_URL, token } : null,
-    },
-  };
+    });
+  }
+  return { sessions: active, session: active[0] || null };
 });
 
 app.get("/api/v1/sessions/:id", async (request, reply) => {
@@ -736,6 +764,12 @@ app.get("/api/v1/sessions/:id/ws", { websocket: true }, (socket, request) => {
         return socket.send(JSON.stringify({ type: "control.heartbeat.ack", at: now() }));
       }
       if (message.type === "client.media.status") {
+        if (message.stage === "ptt_unmuted") {
+          const voiceAt = now();
+          db.prepare("UPDATE remote_sessions SET last_voice_at = ? WHERE id = ? AND status IN ('starting', 'ready')")
+            .run(voiceAt, session.id);
+          scheduleSessionRelease(session.id, session.device_id, voiceAt);
+        }
         request.log.info({ sessionId: session.id, stage: message.stage, detail: message.detail }, "phone media status");
         return;
       }
@@ -751,7 +785,6 @@ app.get("/api/v1/sessions/:id/ws", { websocket: true }, (socket, request) => {
     sessionSockets.delete(socket);
     if (sessionSockets.size === 0) {
       phoneSessionSockets.delete(session.id);
-      scheduleSessionRelease(session.id, session.device_id);
     }
   });
 });
@@ -767,6 +800,8 @@ app.post("/api/v1/sessions/:id/stop", async (request, reply) => {
   if (session.status === "stopped") return { ok: true };
   if (session.status === "starting" && !session.start_dispatched) {
     db.prepare("UPDATE remote_sessions SET status = 'stopped' WHERE id = ?").run(session.id);
+    clearSessionRelease(session.id);
+    closePhoneSessionSockets(session.id, "session ended");
     return { ok: true };
   }
   const socket = bridgeSockets.get(session.device_id);

@@ -9,7 +9,7 @@
 - 当前 MVP 只交付稳定的双向实时语音与设备连接。不得自行扩展音频转写、文字注入、Codex App Server、任务生命周期、Hooks、远程审批或其他智能体能力。
 - 桌面目标是 **Codex Desktop / Codex Voice**，bundle identifier 为 `com.openai.codex`。当前应用路径 `/Volumes/storage/Applications/ChatGPT.app` 以及代码中的 GPT/ChatGPT 历史命名不改变产品目标。
 - Bridge 不是智能体：不得读取 Codex 任务，不得使用 OpenAI API、Cookie 或 API Key，不得接管 Codex 账号或任务生命周期。
-- 单个浏览器客户端同一时刻只连接一个目标 Mac；一个账号同一时刻只拥有一个双向媒体会话。账号可绑定并展示多台设备，切换目标 Mac 时必须先完整停止旧设备会话，再创建新设备会话。
+- 一个账号可同时保留多台 Mac 的独立媒体会话，但手机前端同一时刻只允许一个前台音频目标。切换设备只改变手机当前收发路由：旧设备 Room/Bridge/Codex Voice 保持，手机对旧设备上行 mute、下行 unsubscribe；旧设备只在用户明确断开或语音空闲超时后停止。
 
 ## 2. 权威架构
 
@@ -52,19 +52,21 @@
 
 ### 4.1 浏览器会话
 
-- 一个媒体会话只拥有：一个 `LocalAudioTrack`、一个 LiveKit `Room`、一个 `AudioContext`、一个远端 audio element，以及对应 analyser、计时器和控制 WebSocket。
+- 浏览器为每台已连接设备建立一个独立 runtime；每个 runtime 只拥有一个 `LocalAudioTrack`、一个 LiveKit `Room`、一个 `AudioContext`、一个远端 audio element，以及对应 analyser、计时器和控制 WebSocket。资源不得跨设备复用或由全局单例覆盖。
 - 设备连接时一次性授权麦克风、创建并发布轨道。连接期间 WebRTC 房间和轨道常驻；按住说话只 `unmute`，松开只 `mute`，不得 stop、unpublish、重建轨道、重协商或重启 Bridge 输出。
+- 切换 A→B 时立即把 Live 页目标改为 B 并显示“正在连接”；A runtime 保持但必须先 mute 本地轨道、unsubscribe 远端轨道并停止 audio element，B 成为唯一前台音频 runtime。只有 B 上行已发布且下行已订阅才显示音频“已连接”；只有 Codex Voice 状态 ready 后才显示 PTT。
+- 网络异常的自动媒体重连只属于当前 Live 页设备；离开 Live 页、切换到其他设备、用户明确断开、权限失败或15分钟空闲回收都不得自动重连。
 - 控制 WebSocket 非终止性断开时只重连控制面。关闭码或服务器状态明确表示会话终止时，才释放媒体面。
 - 明确断开、终止性 Room 关闭或服务器判定会话结束时，必须成对执行：停止 PTT → unpublish → Room disconnect → track stop → analyser disconnect → AudioContext close → audio detach → 清理 heartbeat、stats 与 reconnect timer。
-- 页面刷新后先向服务器查询 active session 并恢复真实页面；不得仅依赖内存 UI 状态。设备列表刷新必须读取服务器真实设备和会话状态。
+- 页面刷新后先向服务器查询全部 active sessions，并按本地最后一个 Live 目标只恢复该设备的前台媒体；其他设备继续作为服务器/Bridge 后台会话，选中时再以新 token 恢复。不得仅依赖内存 UI 状态。
 
 ### 4.2 服务器会话
 
 - 每台设备只允许一个有效 Bridge WebSocket；新连接替换旧连接。旧连接的迟到 `ready`/`failed` 不得复活已经停止的会话。
-- 每个账号只允许一个 `starting`/`ready`/`stopping` 媒体租约，并由数据库部分唯一索引兜底。新启动必须先关闭旧手机控制 socket，向旧会话所属的准确 Bridge 发送 `session.stop` 并等待停止确认；旧会话未释放时不得签发新房间 token。
+- 每台设备只允许一个 `starting`/`ready`/`stopping` 媒体租约，并由数据库部分唯一索引兜底；同一账号可在不同设备上并存会话。对已存在的同设备会话，创建接口必须幂等返回现有 session 与新 phone token，不能重复触发 Bridge 或 Codex Voice。
 - LiveKit token 必须同时锁定 session UUID 房间、参与者角色与可发布 source：phone 只发布 `MICROPHONE`，Bridge 只发布 `SCREEN_SHARE_AUDIO`，双方不得发布 data。
 - Bridge 断开时，仍处于 starting/ready 的会话必须被标记 stopped。
-- 手机控制连接暂时归零时保留媒体会话，进入 10 分钟恢复窗口；手机重新连接即取消回收计时。窗口到期仍无客户端时，服务器标记 stopped、通知 Bridge，并关闭该会话的剩余手机 socket。
+- 每台设备从创建或最近一次 `ptt_unmuted` 起独立计算15分钟语音空闲时间；到期后服务器标记 stopped、关闭该 session 的手机 socket 并通知准确的 Bridge。控制 socket 数量、页面是否前台和设备切换不得重置该计时。
 - 显式断开不进入恢复窗口，立即向 Bridge 下发 stop；重复 stop 必须幂等。
 
 ### 4.3 Mac Bridge 会话
@@ -79,6 +81,7 @@
 
 - 用户确认的 Voice chat hotkey 是 `Control+Shift+V`。Bridge 必须通过原生 CoreGraphics HID `send-hotkey` 触发，禁止使用 AppleScript `keystroke`，禁止回退到切换 Chat、创建新任务或 `Command+N`。
 - Voice 是否真正启动以 `audio-device.swift process-io com.openai.codex` 的 CoreAudio 输入状态为准，不以窗口标题、启动音、UI 波形或“是否主动打招呼”为准。
+- 启动请求发现 Codex Voice 已有真实 CoreAudio 输入时必须直接复用，不发送快捷键、不先关闭再重开；Bridge 对同一 session 的重复 start 也只回报 ready。
 - 不得重启 Codex。只有在刷新系统音频设备缓存确有必要且用户允许时，才可单独重启 Codex Chromium AudioService helper。
 
 ## 5. 认证、安全与数据边界
@@ -93,7 +96,8 @@
 - 保留现有紧凑深绿色移动端结构：登录/配对、真实设备列表、连接中的语音页。除非用户明确要求，不做整体重设计。
 - 语音按钮是常驻底部的圆形 floating icon button；长按区域与相关文本禁止选择。按住时三点波形必须来自同一真实输入电平，且限制最大高度。
 - 图标按钮无外框、点击反馈一致、图标视觉尺寸一致，不增加单独的“启用音频”页面或按钮。
-- Live 页顶部设备名称只打开在线设备 source dropdown；选择另一设备时先完整停止当前 session，再建立新 session。返回设备管理使用独立的回退按钮，不得复用设备下拉或整页跳转。
+- Live 页顶部设备名称只打开在线设备 source dropdown；选择另一设备时立即留在 Live 页显示新设备及“正在连接”，旧 session 不停止。返回设备管理使用独立的回退按钮。
+- 设备管理允许修改账号内设备的显示名称和展示图标；图标固定为手机、Pad、MacBook、Mac mini 四种，只影响 UI，不改变 Bridge 硬件身份、凭据或媒体能力。
 - 浏览器只保留下行静音/恢复按钮；扬声器、听筒与蓝牙的真实路由交由手机系统管理。不得展示目标移动浏览器不能可靠执行的 `selectAudioOutput`/`setSinkId` 伪切换入口。
 - 蓝牙断开后“必须自动回到手机扬声器”是产品目标，但通用移动浏览器无法可靠强制通信音频从听筒切到扬声器。PWA 只能在 `devicechange` 可用时检测变化并提供系统路由指引；若该行为要求零用户操作和跨浏览器保证，必须使用具备原生音频路由 API 的 Android/HarmonyOS 客户端。
 - 不根据音频电平推断并展示“Codex 正在回复”等状态；居中的三点指示器只表达当前真实音频电平，PTT 只显示“按住说话”或“正在发送”。

@@ -131,6 +131,7 @@ socket.on("message", async (raw) => {
       console.log("  正在启动 Codex Voice 并验证音频输入状态…");
       let media: MacAudioBridge | null = null;
       let voiceStartAttempted = false;
+      let voiceStartedForSession = false;
       try {
         if (!message.media?.url || !message.media.token) throw new Error("media_credentials_missing");
         if (activeSessionId === message.sessionId && activeMedia) {
@@ -149,7 +150,7 @@ socket.on("message", async (raw) => {
           sessionTransition = sessionTransition.then(async () => {
             if (activeMedia !== media) return;
             activeMedia = null;
-            if (activeSessionId === message.sessionId && process.env.MEDIA_ONLY_MODE !== "true") {
+            if (activeSessionId === message.sessionId && voiceStartedForSession && process.env.MEDIA_ONLY_MODE !== "true") {
               await stopAndVerifyVoice(desktopVoiceConfigFromEnv()).catch(() => null);
             }
             activeSessionId = null;
@@ -169,6 +170,8 @@ socket.on("message", async (raw) => {
         const config = desktopVoiceConfigFromEnv();
         voiceStartAttempted = true;
         const voice = await startAndVerifyVoice(config);
+        voiceStartedForSession = !voice.alreadyActive;
+        voiceStartAttempted = voiceStartedForSession;
         console.log(`[audio][${message.sessionId}][codex.input] ${JSON.stringify({ active: voice.audio.input, pids: voice.audio.pids })}`);
         activeSessionId = message.sessionId;
         console.log("✓ Codex Voice 音频输入已验证\n");

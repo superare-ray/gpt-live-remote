@@ -29,9 +29,10 @@
 | KI-011 | 看似 E2E 通过，真实设备却未收到回复 | 把连接音当作回复 | 诊断规则 |
 | KI-012 | 多个 Bridge、aggregate 或 helper 遗留 | 资源所有权与退出路径 | 已实施待复验 |
 | KI-013 | 忘记授权麦克风时只显示连接超时 | 浏览器权限 → 媒体创建 | 已实施待复验 |
-| KI-014 | 切换 Mac 后两台设备仍参与收发音频 | 账号会话租约与 LiveKit 房间隔离 | 用户已确认 |
+| KI-014 | 切换 Mac 后两台设备仍参与收发音频 | 设备会话隔离与前台媒体选择 | 已实施待复验 |
 | KI-015 | Bridge 进程存活但设备长期显示离线 | Control WebSocket 1006 后未自愈 | 已知待修复 |
 | KI-016 | 蓝牙断开后声音落到听筒且很小 | 移动系统通信音频路由 | 平台能力边界 |
+| KI-017 | 切换设备必须先停旧设备，且跳离 Live 页 | PWA 单例媒体 runtime/账号单租约 | 已实施待复验 |
 
 ## KI-001：子路径发生 308 重定向循环
 
@@ -139,7 +140,7 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 **处理方式**
 
 - 页面启动时从服务器读取 active session 与真实设备状态；有活动会话则恢复沟通页，没有才显示设备列表。
-- 服务器在最后一个手机控制连接消失后保留 10 分钟恢复窗口；返回时取消回收 timer。
+- 服务器保留每台设备的独立会话，并按创建或最近一次用户 `ptt_unmuted` 后15分钟回收；刷新只恢复最后一个 Live 目标的前台媒体，其他会话保持后台。
 - 终止性控制关闭码才拆媒体；普通网络闪断仅重连控制 socket。
 
 **状态**
@@ -215,14 +216,14 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 
 **已实施处理**
 
-- Control API 改为账号级单一媒体租约；新会话创建前，先认领该账号全部 `starting`/`ready`/`stopping` 会话，关闭旧手机控制 socket，向准确的旧 Bridge 发送 `session.stop` 并等待确认。
-- SQLite 使用 `remote_sessions_one_active_per_user` 部分唯一索引作为并发兜底；旧租约未完全释放时拒绝创建新会话。
-- LiveKit token 锁定 session UUID 房间和角色：phone 只可发布 `MICROPHONE`，Bridge 只可发布 `SCREEN_SHARE_AUDIO`，且禁止 data publication。
+- 第一阶段曾用账号级单租约彻底停止旧设备，并由用户确认解决了跨房间泄漏；后续产品目标明确要求多设备会话并存，因此该策略已被有意替换，不能再恢复账号级唯一索引。
+- 当前 Control API 使用 `remote_sessions_one_active_per_device`，每台 Mac 最多一个会话；不同设备可并存。LiveKit token 继续锁定 session UUID 房间和角色：phone 只可发布 `MICROPHONE`，Bridge 只可发布 `SCREEN_SHARE_AUDIO`。
+- PWA 为每台设备持有独立 runtime，但任一时刻只有 Live 页选中的设备允许手机上行 unmute 和下行 subscribe；切到后台的设备必须同时 mute/unsubscribe，防止此前的双向串流重新出现。
 
 **验证**
 
-- 2026-08-13：Control API typecheck/build、遗留重复数据迁移、唯一索引并发约束、线上源码校验和与服务健康边界均已确认；未主动创建媒体会话。
-- 2026-08-13：用户随后明确确认多设备/音频链路稳定，因此账号级单租约隔离提升为“用户已确认”。
+- 2026-08-13：用户确认旧账号级单租约版本解决了串流，但随后明确改变产品语义为多设备后台并存、手机前台独占。
+- 新的 per-device + foreground-only 实现已通过静态检查，仍需用户在 Mono/Raymond 真机切换时确认：A 保持会话但 RTP 上下行暂停，B 独占手机音频。
 
 ## KI-015：Bridge 进程存活但 Control WebSocket 已死亡
 
@@ -263,6 +264,25 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 **状态**
 
 - 2026-08-13：根因边界与平台能力已确认；尚未实现 PWA 的设备变化提示，也未建立原生客户端。
+
+## KI-017：切换设备会先停止旧设备并离开 Live 页
+
+**症状与根因**
+
+- 旧 PWA 只有一组全局 Room、mic track、audio element、control socket 和 analyser；`connectDevice(B)` 必须先调用 `stopCurrentSession(A)` 与 `disconnectMedia()`。
+- Control API 同时使用账号级唯一租约，新建 B 前会等待 A Bridge 完整停止。因此前端无法立即显示 B，也无法保留 A 的 Codex Voice。
+
+**已实施处理**
+
+- 每台设备使用独立 `DeviceSessionRuntime`，资源、回调、计时器和清理路径按 device/session 所有；切换不会覆盖另一设备引用。
+- 点击 B 立即留在 Live 页并显示 B“正在连接”；A 只 mute 本地 publication、unsubscribe 远端 publication、暂停 audio element，Room/Bridge/Codex Voice 保持。
+- B 只有上行 publication 与下行 subscription 都就绪才显示音频已连接；Codex Voice ready 后才出现 PTT。B 网络失败停留原页并自动重连；明确断开、离开 Live、权限失败和空闲超时不触发自动重连。
+- Control API 改为每设备唯一会话并幂等复用已存在会话；`ptt_unmuted` 刷新独立15分钟语音空闲期限。
+- Bridge 检测到 Codex Voice 已有真实输入时直接复用，不再先关闭后重新触发快捷键。
+
+**验证**
+
+- PWA lint/build、Control API typecheck/build、Mac Bridge typecheck/native build 均通过。尚未执行媒体或 Voice 测试，等待用户在两台真实 Mac 与手机上复验。
 
 ## 新故障登记流程
 
