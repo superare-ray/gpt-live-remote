@@ -15,8 +15,8 @@ import {
   Volume2,
   Waves,
 } from "lucide-react";
-import { FormEvent, PointerEvent, useCallback, useEffect, useRef, useState } from "react";
-import type { LocalAudioTrack, Room } from "livekit-client";
+import { FormEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useRef, useState } from "react";
+import type { LocalAudioTrack, RemoteAudioTrack, Room } from "livekit-client";
 
 type AuthUser = { id: string; email: string };
 type Device = {
@@ -33,16 +33,19 @@ type RemoteSession = {
   failureReason?: string | null;
   media?: { url: string; token: string } | null;
 };
-type ContentEntry = {
-  id: string;
-  order: number;
-  role: "user" | "assistant";
-  kind: "text" | "image" | "video" | "audio" | "file" | "unsupported";
-  text?: string;
-  label?: string;
-};
 type WaveLevels = [number, number, number];
 type AudioPlaybackStatus = "idle" | "waiting" | "ready" | "blocked" | "error";
+type ClientMediaStage =
+  | "microphone_published"
+  | "ptt_unmute_requested"
+  | "ptt_unmuted"
+  | "ptt_muted"
+  | "rtc_stats"
+  | "track_subscribed"
+  | "track_unsubscribed"
+  | "playback_ready"
+  | "playback_blocked"
+  | "playback_error";
 const appBasePath = process.env.NEXT_PUBLIC_APP_BASE_PATH ?? "";
 const sessionFailureMessages: Record<string, string> = {
   voice_shortcut_not_configured: "Mac 尚未配置 Voice 快捷键",
@@ -108,14 +111,14 @@ export default function Home() {
   const [remoteSession, setRemoteSession] = useState<RemoteSession | null>(null);
   const [showDevicePicker, setShowDevicePicker] = useState(false);
   const [talking, setTalking] = useState(false);
-  const [contentItems, setContentItems] = useState<ContentEntry[]>([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
+  const [replying, setReplying] = useState(false);
   const [mediaStatus, setMediaStatus] = useState<"idle" | "connecting" | "connected">("idle");
   const [audioPlaybackStatus, setAudioPlaybackStatus] = useState<AudioPlaybackStatus>("idle");
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const roomRef = useRef<Room | null>(null);
   const micTrackRef = useRef<LocalAudioTrack | null>(null);
+  const remoteAudioTrackRef = useRef<RemoteAudioTrack | null>(null);
   const remoteAudioElementRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const localAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -124,43 +127,18 @@ export default function Home() {
   const remoteAnalyserRef = useRef<AnalyserNode | null>(null);
   const talkingRef = useRef(false);
   const activePointerRef = useRef<number | null>(null);
+  const remotePlaybackAllowedRef = useRef(false);
   const controlSocketRef = useRef<WebSocket | null>(null);
   const controlSessionRef = useRef<string | null>(null);
   const controlHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const sessionIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const contentListRef = useRef<HTMLDivElement | null>(null);
+  const controlReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mediaStatsTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mediaStatsRunningRef = useRef(false);
   const voiceControlsRef = useRef<HTMLDivElement | null>(null);
-  const historyCursorRef = useRef<string | null | undefined>(undefined);
-  const historyLoadingRef = useRef(false);
   const mediaConnectionAttemptRef = useRef(0);
   const [waveLevels, setWaveLevels] = useState<WaveLevels>([0, 0, 0]);
 
-  const mergeContent = useCallback((items: ContentEntry[], prepend = false) => {
-    const list = contentListRef.current;
-    const previousHeight = list?.scrollHeight || 0;
-    const wasNearBottom = !list || list.scrollHeight - list.scrollTop - list.clientHeight < 96;
-    setContentItems((current) => {
-      const byId = new Map(current.map((entry) => [entry.id, entry]));
-      items.forEach((entry) => byId.set(entry.id, entry));
-      return [...byId.values()].sort((left, right) => left.order - right.order);
-    });
-    requestAnimationFrame(() => {
-      if (!list) return;
-      if (prepend) list.scrollTop += list.scrollHeight - previousHeight;
-      else if (wasNearBottom) list.scrollTop = list.scrollHeight;
-    });
-  }, []);
-
-  const requestOlderContent = useCallback(() => {
-    const socket = controlSocketRef.current;
-    const before = historyCursorRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN || before == null || historyLoadingRef.current) return;
-    historyLoadingRef.current = true;
-    setHistoryLoading(true);
-    socket.send(JSON.stringify({ type: "session.content.history.request", before, limit: 20 }));
-  }, []);
-
-  const reportClientMedia = useCallback((stage: "track_subscribed" | "track_unsubscribed" | "playback_ready" | "playback_blocked" | "playback_error", detail?: string) => {
+  const reportClientMedia = useCallback((stage: ClientMediaStage, detail?: string) => {
     const socket = controlSocketRef.current;
     if (socket?.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: "client.media.status", stage, detail }));
@@ -168,10 +146,10 @@ export default function Home() {
 
   const closeSessionControl = useCallback(() => {
     controlSessionRef.current = null;
+    if (controlReconnectTimerRef.current) clearTimeout(controlReconnectTimerRef.current);
+    controlReconnectTimerRef.current = null;
     if (controlHeartbeatRef.current) clearInterval(controlHeartbeatRef.current);
-    if (sessionIdleTimerRef.current) clearTimeout(sessionIdleTimerRef.current);
     controlHeartbeatRef.current = null;
-    sessionIdleTimerRef.current = null;
     const socket = controlSocketRef.current;
     controlSocketRef.current = null;
     if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "session closed");
@@ -199,17 +177,24 @@ export default function Home() {
 
   const disconnectMedia = useCallback(async () => {
     mediaConnectionAttemptRef.current += 1;
+    remotePlaybackAllowedRef.current = false;
+    activePointerRef.current = null;
     setMediaStatus("idle");
     setAudioPlaybackStatus("idle");
+    setReplying(false);
+    talkingRef.current = false;
+    setTalking(false);
     const track = micTrackRef.current;
     micTrackRef.current = null;
-    if (track) {
-      await track.mute().catch(() => null);
-      track.stop();
-    }
     const room = roomRef.current;
     roomRef.current = null;
-    if (room) await room.disconnect();
+    remoteAudioTrackRef.current = null;
+    if (mediaStatsTimerRef.current) clearInterval(mediaStatsTimerRef.current);
+    mediaStatsTimerRef.current = null;
+    if (track) await track.mute().catch(() => null);
+    if (room && track) await room.localParticipant.unpublishTrack(track, false).catch(() => null);
+    if (room) await room.disconnect().catch(() => null);
+    if (track) track.stop();
     closeSessionControl();
     await closeAudioGraph();
   }, [closeAudioGraph, closeSessionControl]);
@@ -227,6 +212,7 @@ export default function Home() {
     audioElement.preload = "auto";
     audioElement.style.display = "none";
     const handlePlaying = () => {
+      if (!remotePlaybackAllowedRef.current) return;
       setAudioPlaybackStatus("ready");
       reportClientMedia("playback_ready", "audio_element_playing");
     };
@@ -274,23 +260,6 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const stopTalking = () => {
-      if (document.visibilityState === "hidden" || !document.hasFocus()) {
-        activePointerRef.current = null;
-        talkingRef.current = false;
-        setTalking(false);
-        void micTrackRef.current?.mute().catch(() => null);
-      }
-    };
-    document.addEventListener("visibilitychange", stopTalking);
-    window.addEventListener("blur", stopTalking);
-    return () => {
-      document.removeEventListener("visibilitychange", stopTalking);
-      window.removeEventListener("blur", stopTalking);
-    };
-  });
-
-  useEffect(() => {
     if (!activeDevice || !remoteSession) return;
     let animationFrame = 0;
     let lastUpdate = 0;
@@ -316,7 +285,11 @@ export default function Home() {
 
     const renderMeter = (time: number) => {
       if (time - lastUpdate >= 45) {
-        const measured = measure(talkingRef.current ? localAnalyserRef.current : remoteAnalyserRef.current);
+        const local = measure(localAnalyserRef.current);
+        const remote = measure(remoteAnalyserRef.current);
+        const remoteActive = Math.max(...remote) > 0.05;
+        const measured = remoteActive ? remote : local;
+        setReplying(remoteActive);
         smoothed = smoothed.map((value, index) => value * 0.58 + measured[index] * 0.42) as WaveLevels;
         setWaveLevels(smoothed);
         lastUpdate = time;
@@ -355,22 +328,8 @@ export default function Home() {
           const message = JSON.parse(String(event.data)) as {
             type?: string;
             error?: string;
-            content?: ContentEntry;
-            items?: ContentEntry[];
-            nextCursor?: string | null;
           };
           if (message.type === "control.error" && message.error === "bridge_offline") setNotice("Mac Bridge 已离线");
-          if (message.type === "session.content.snapshot" && Array.isArray(message.items)) {
-            mergeContent(message.items);
-            if ("nextCursor" in message) historyCursorRef.current = message.nextCursor;
-          } else if (message.type === "session.content.history" && Array.isArray(message.items)) {
-            mergeContent(message.items, historyCursorRef.current !== undefined);
-            historyCursorRef.current = message.nextCursor ?? null;
-            historyLoadingRef.current = false;
-            setHistoryLoading(false);
-          } else if (message.type === "session.content" && message.content) {
-            mergeContent([message.content]);
-          }
         } catch {
           // Ignore unknown status messages; the socket remains usable.
         }
@@ -378,37 +337,37 @@ export default function Home() {
       socket.onerror = () => {
         if (!settled) reject(new Error("控制连接建立失败"));
       };
-      socket.onclose = () => {
+      socket.onclose = (event) => {
         window.clearTimeout(connectTimeout);
-        if (controlSocketRef.current === socket) controlSocketRef.current = null;
-        if (controlHeartbeatRef.current) clearInterval(controlHeartbeatRef.current);
-        controlHeartbeatRef.current = null;
+        const isCurrentSocket = controlSocketRef.current === socket;
+        if (isCurrentSocket) {
+          controlSocketRef.current = null;
+          if (controlHeartbeatRef.current) clearInterval(controlHeartbeatRef.current);
+          controlHeartbeatRef.current = null;
+        }
         if (!settled) reject(new Error("控制连接建立失败"));
-        if (controlSessionRef.current !== sessionId) return;
-        controlSessionRef.current = null;
-        void disconnectMedia().finally(() => {
-          talkingRef.current = false;
-          setTalking(false);
-          setConnectingId(null);
-          setNotice("连接已断开，请重新连接设备");
-        });
+        if (!isCurrentSocket || controlSessionRef.current !== sessionId || !roomRef.current) return;
+        if (event.code === 4001 || event.code === 1008) {
+          controlSessionRef.current = null;
+          void disconnectMedia().finally(() => {
+            setConnectingId(null);
+            setRemoteSession(null);
+            setActiveDevice(null);
+            setShowDevicePicker(true);
+            setNotice("连接已断开，请重新连接设备");
+            void loadDevices();
+          });
+          return;
+        }
+        setNotice("控制连接正在恢复");
+        if (controlReconnectTimerRef.current) clearTimeout(controlReconnectTimerRef.current);
+        controlReconnectTimerRef.current = window.setTimeout(() => {
+          controlReconnectTimerRef.current = null;
+          if (controlSessionRef.current !== sessionId || !roomRef.current) return;
+          void openSessionControl(sessionId).then(() => setNotice(null)).catch(() => null);
+        }, 1_500);
       };
     });
-  }
-
-  function armSessionIdleTimeout(sessionId: string) {
-    if (sessionIdleTimerRef.current) clearTimeout(sessionIdleTimerRef.current);
-    sessionIdleTimerRef.current = setTimeout(() => {
-      void request(`/api/v1/sessions/${sessionId}/stop`, { method: "POST", body: "{}" }).catch(() => null).finally(() => {
-        void disconnectMedia().finally(() => {
-          talkingRef.current = false;
-          setTalking(false);
-          setRemoteSession(null);
-          setActiveDevice(null);
-          setShowDevicePicker(true);
-        });
-      });
-    }, 10 * 60_000);
   }
 
   async function sendLoginCode(event: FormEvent) {
@@ -459,20 +418,24 @@ export default function Home() {
     if (!remoteSession || disconnecting) return;
     setDisconnecting(true);
     setNotice(null);
+    let stopError: Error | null = null;
     try {
       await request(`/api/v1/sessions/${remoteSession.id}/stop`, { method: "POST", body: "{}" });
+    } catch (error) {
+      stopError = error as Error;
+    } finally {
       await disconnectMedia();
       talkingRef.current = false;
       setTalking(false);
       setRemoteSession(null);
       setActiveDevice(null);
       setShowDevicePicker(true);
-      await loadDevices();
-    } catch (error) {
-      setNotice((error as Error).message);
-      if (propagateError) throw error;
-    } finally {
+      await loadDevices().catch(() => null);
       setDisconnecting(false);
+    }
+    if (stopError) {
+      setNotice(stopError.message);
+      if (propagateError) throw stopError;
     }
   }
 
@@ -487,23 +450,25 @@ export default function Home() {
     setAudioPlaybackStatus("waiting");
 
     try {
+      remotePlaybackAllowedRef.current = false;
       const audioContext = new AudioContext({ latencyHint: "interactive" });
       audioContextRef.current = audioContext;
       await audioContext.resume().catch(() => null);
       ensureCurrentAttempt();
       const { createLocalAudioTrack, Room, RoomEvent, Track } = await import("livekit-client");
       const localMic = await withTimeout(createLocalAudioTrack({
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      }).then((track) => {
-        if (mediaConnectionAttemptRef.current !== attempt) {
-          track.stop();
-          throw new Error("连接已取消");
-        }
-        return track;
-      }), 12_000, "麦克风连接超时");
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }).then((track) => {
+          if (mediaConnectionAttemptRef.current !== attempt) {
+            track.stop();
+            throw new Error("连接已取消");
+          }
+          return track;
+        }), 12_000, "麦克风连接超时");
       ensureCurrentAttempt();
+      await localMic.mute();
       micTrackRef.current = localMic;
       const localSource = audioContext.createMediaStreamSource(new MediaStream([localMic.mediaStreamTrack]));
       const localAnalyser = audioContext.createAnalyser();
@@ -515,20 +480,22 @@ export default function Home() {
 
       await openSessionControl(session.id);
       ensureCurrentAttempt();
-      const room = new Room({ adaptiveStream: false, dynacast: false });
+      const room = new Room({ adaptiveStream: false, dynacast: false, stopLocalTrackOnUnpublish: false });
       roomRef.current = room;
       room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
         if (track.kind !== Track.Kind.Audio) return;
+        remoteAudioTrackRef.current = track as RemoteAudioTrack;
         setAudioPlaybackStatus("waiting");
         reportClientMedia("track_subscribed", `${participant.identity}:${publication.trackSid}`);
         const audioElement = remoteAudioElementRef.current;
         if (audioElement) {
           track.attach(audioElement);
-          audioElement.muted = false;
+          audioElement.muted = !remotePlaybackAllowedRef.current;
           audioElement.volume = 1;
           void room.startAudio()
             .then(() => audioElement.play())
             .then(() => {
+              if (!remotePlaybackAllowedRef.current) return;
               setAudioPlaybackStatus("ready");
               reportClientMedia("playback_ready", "track_autoplay_started");
             })
@@ -555,6 +522,7 @@ export default function Home() {
       });
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         if (track.kind !== Track.Kind.Audio) return;
+        if (remoteAudioTrackRef.current === track) remoteAudioTrackRef.current = null;
         setAudioPlaybackStatus("waiting");
         reportClientMedia("track_unsubscribed", track.sid);
         const audioElement = remoteAudioElementRef.current;
@@ -570,6 +538,10 @@ export default function Home() {
       });
       room.on(RoomEvent.AudioPlaybackStatusChanged, (canPlay) => {
         if (roomRef.current !== room) return;
+        if (!remotePlaybackAllowedRef.current) {
+          setAudioPlaybackStatus("waiting");
+          return;
+        }
         reportClientMedia(canPlay ? "playback_ready" : "playback_blocked", "livekit_playback_status");
         setAudioPlaybackStatus(canPlay
           ? remoteAudioElementRef.current?.srcObject ? "ready" : "waiting"
@@ -577,15 +549,9 @@ export default function Home() {
       });
       room.on(RoomEvent.Disconnected, () => {
         if (roomRef.current !== room) return;
-        roomRef.current = null;
-        micTrackRef.current?.stop();
-        micTrackRef.current = null;
-        closeSessionControl();
-        void closeAudioGraph();
-        setMediaStatus("idle");
-        talkingRef.current = false;
-        setTalking(false);
-        setNotice("媒体连接已断开，请重新连接设备");
+        void disconnectMedia().finally(() => {
+          setNotice("媒体连接已断开，请重新连接设备");
+        });
       });
       await withTimeout(room.connect(session.media.url, session.media.token, { autoSubscribe: true }), 12_000, "媒体连接超时");
       ensureCurrentAttempt();
@@ -593,10 +559,56 @@ export default function Home() {
         name: "phone-microphone",
         source: Track.Source.Microphone,
       }), 8_000, "麦克风发布超时");
+      reportClientMedia("microphone_published", JSON.stringify({
+        muted: localMic.isMuted,
+        enabled: localMic.mediaStreamTrack.enabled,
+        readyState: localMic.mediaStreamTrack.readyState,
+        sampleRate: localMic.mediaStreamTrack.getSettings().sampleRate,
+        channelCount: localMic.mediaStreamTrack.getSettings().channelCount,
+      }));
+      const reportRtcStats = async () => {
+        if (mediaStatsRunningRef.current || roomRef.current !== room) return;
+        mediaStatsRunningRef.current = true;
+        try {
+          const summarize = (report: RTCStatsReport | undefined, direction: "outbound-rtp" | "inbound-rtp") => {
+            let result: Record<string, unknown> | null = null;
+            report?.forEach((entry) => {
+              if (entry.type !== direction || entry.kind !== "audio") return;
+              result = direction === "outbound-rtp"
+                ? { bytes: entry.bytesSent, packets: entry.packetsSent, retransmitted: entry.retransmittedPacketsSent }
+                : { bytes: entry.bytesReceived, packets: entry.packetsReceived, lost: entry.packetsLost, jitter: entry.jitter };
+            });
+            return result;
+          };
+          const [outbound, inbound] = await Promise.all([
+            localMic.getRTCStatsReport(),
+            remoteAudioTrackRef.current?.getRTCStatsReport(),
+          ]);
+          reportClientMedia("rtc_stats", JSON.stringify({
+            microphone: {
+              muted: localMic.isMuted,
+              enabled: localMic.mediaStreamTrack.enabled,
+              readyState: localMic.mediaStreamTrack.readyState,
+            },
+            outbound: summarize(outbound, "outbound-rtp"),
+            inbound: summarize(inbound, "inbound-rtp"),
+            playback: {
+              paused: remoteAudioElementRef.current?.paused,
+              readyState: remoteAudioElementRef.current?.readyState,
+              muted: remoteAudioElementRef.current?.muted,
+            },
+          }));
+        } finally {
+          mediaStatsRunningRef.current = false;
+        }
+      };
+      await reportRtcStats();
+      mediaStatsTimerRef.current = window.setInterval(() => void reportRtcStats(), 2_000);
       ensureCurrentAttempt();
-      await localMic.mute();
       await request(`/api/v1/sessions/${session.id}/media-ready`, { method: "POST", body: "{}" });
       ensureCurrentAttempt();
+      talkingRef.current = false;
+      setTalking(false);
       setMediaStatus("connected");
     } catch (error) {
       if (mediaConnectionAttemptRef.current === attempt) await disconnectMedia();
@@ -624,14 +636,15 @@ export default function Home() {
     setActiveDevice(device);
     setShowDevicePicker(false);
     setConnectingId(null);
-    armSessionIdleTimeout(readySession.id);
+    remotePlaybackAllowedRef.current = true;
+    resumeRemoteAudio();
   }
 
   async function connectDevice(device: Device) {
+    unlockRemoteAudioFromGesture();
     setConnectingId(device.id);
     setNotice(null);
-    setContentItems([]);
-    historyCursorRef.current = undefined;
+    let createdSession: RemoteSession | null = null;
     if (remoteSession) {
       try {
         await stopCurrentSession(true);
@@ -645,22 +658,18 @@ export default function Home() {
         method: "POST",
         body: JSON.stringify({ deviceId: device.id }),
       });
+      createdSession = result.session;
       await activateSession(result.session, device);
     } catch (error) {
+      if (createdSession) {
+        await request(`/api/v1/sessions/${createdSession.id}/stop`, { method: "POST", body: "{}" }).catch(() => null);
+      }
       setConnectingId(null);
       await disconnectMedia();
+      setRemoteSession(null);
+      setActiveDevice(null);
+      setShowDevicePicker(true);
       setNotice((error as Error).message);
-    }
-  }
-
-  function setPtt(active: boolean) {
-    if (!remoteSession || active === talkingRef.current) return;
-    armSessionIdleTimeout(remoteSession.id);
-    talkingRef.current = active;
-    setTalking(active);
-    const micTrack = micTrackRef.current;
-    if (micTrack) {
-      void (active ? micTrack.unmute() : micTrack.mute()).catch(() => setNotice("麦克风控制失败"));
     }
   }
 
@@ -671,12 +680,16 @@ export default function Home() {
     if (audioContextRef.current) operations.push(audioContextRef.current.resume());
     if (room) operations.push(room.startAudio());
     if (audioElement?.srcObject) {
-      audioElement.muted = false;
+      audioElement.muted = !remotePlaybackAllowedRef.current;
       audioElement.volume = 1;
       operations.push(audioElement.play());
     }
     void Promise.all(operations).then(() => {
       if (audioElement?.srcObject) {
+        if (!remotePlaybackAllowedRef.current) {
+          setAudioPlaybackStatus("waiting");
+          return;
+        }
         setAudioPlaybackStatus("ready");
         reportClientMedia("playback_ready", "user_gesture_resume");
       } else if (room) {
@@ -689,30 +702,100 @@ export default function Home() {
     });
   }
 
-  function handlePointerDown(event: PointerEvent<HTMLButtonElement>) {
+  function startTalking(event: ReactPointerEvent<HTMLButtonElement>) {
     if ((event.pointerType === "mouse" && event.button !== 0) || activePointerRef.current !== null) return;
     event.preventDefault();
     activePointerRef.current = event.pointerId;
-    resumeRemoteAudio();
-    if (mediaStatus === "connected" && micTrackRef.current) {
-      void setPtt(true);
-    } else if (remoteSession && mediaStatus !== "connecting") {
-      setNotice(null);
-      void joinSessionMedia(remoteSession).then(() => {
-        if (activePointerRef.current === event.pointerId) setPtt(true);
-      }).catch((error) => setNotice((error as Error).message));
-    }
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch {
-      // The control request must not depend on browser pointer-capture support.
+      // Older mobile browsers can emit Pointer Events without supporting pointer capture.
     }
+    resumeRemoteAudio();
+    const track = micTrackRef.current;
+    if (!track || mediaStatus !== "connected") return;
+    reportClientMedia("ptt_unmute_requested", JSON.stringify({
+      muted: track.isMuted,
+      enabled: track.mediaStreamTrack.enabled,
+      readyState: track.mediaStreamTrack.readyState,
+    }));
+    talkingRef.current = true;
+    setTalking(true);
+    void track.unmute().then(() => {
+      reportClientMedia("ptt_unmuted", JSON.stringify({
+        muted: track.isMuted,
+        enabled: track.mediaStreamTrack.enabled,
+        readyState: track.mediaStreamTrack.readyState,
+      }));
+      if (!talkingRef.current || micTrackRef.current !== track) void track.mute();
+    }).catch(() => {
+      talkingRef.current = false;
+      setTalking(false);
+      setNotice("麦克风暂时不可用，请重新连接设备");
+    });
   }
 
-  function handlePointerUp(event?: PointerEvent<HTMLButtonElement>) {
+  function stopTalking(event?: ReactPointerEvent<HTMLButtonElement>) {
     if (event && activePointerRef.current !== null && event.pointerId !== activePointerRef.current) return;
+    event?.preventDefault();
     activePointerRef.current = null;
-    void setPtt(false);
+    talkingRef.current = false;
+    setTalking(false);
+    const track = micTrackRef.current;
+    void track?.mute().then(() => reportClientMedia("ptt_muted", JSON.stringify({
+      muted: track.isMuted,
+      enabled: track.mediaStreamTrack.enabled,
+      readyState: track.mediaStreamTrack.readyState,
+    })));
+  }
+
+  useEffect(() => {
+    const stopWhenInactive = () => {
+      if (document.visibilityState === "hidden" || !document.hasFocus()) {
+        activePointerRef.current = null;
+        talkingRef.current = false;
+        setTalking(false);
+        void micTrackRef.current?.mute();
+      }
+    };
+    window.addEventListener("blur", stopWhenInactive);
+    document.addEventListener("visibilitychange", stopWhenInactive);
+    return () => {
+      window.removeEventListener("blur", stopWhenInactive);
+      document.removeEventListener("visibilitychange", stopWhenInactive);
+    };
+  }, []);
+
+  function unlockRemoteAudioFromGesture() {
+    const audioElement = remoteAudioElementRef.current;
+    if (!audioElement || audioElement.srcObject) {
+      resumeRemoteAudio();
+      return;
+    }
+    const sampleCount = 2_400;
+    const wav = new ArrayBuffer(44 + sampleCount * 2);
+    const view = new DataView(wav);
+    const writeText = (offset: number, value: string) => {
+      for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+    };
+    writeText(0, "RIFF");
+    view.setUint32(4, 36 + sampleCount * 2, true);
+    writeText(8, "WAVEfmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, 48_000, true);
+    view.setUint32(28, 96_000, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeText(36, "data");
+    view.setUint32(40, sampleCount * 2, true);
+    const url = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
+    audioElement.src = url;
+    audioElement.muted = false;
+    void audioElement.play().catch(() => null).finally(() => {
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    });
   }
 
   useEffect(() => {
@@ -746,8 +829,12 @@ export default function Home() {
               await activateSession(session, device);
             } catch (error) {
               if (!cancelled) {
+                await request(`/api/v1/sessions/${session.id}/stop`, { method: "POST", body: "{}" }).catch(() => null);
                 await disconnectMedia();
                 setConnectingId(null);
+                setRemoteSession(null);
+                setActiveDevice(null);
+                setShowDevicePicker(true);
                 setNotice((error as Error).message);
               }
             }
@@ -809,13 +896,13 @@ export default function Home() {
   }
 
   if (activeDevice && remoteSession && !showDevicePicker) {
-    const replyActive = !talking && Math.max(...waveLevels) > 0.08;
+    const replyActive = replying;
     const connectionStatus = mediaStatus === "connected"
-      ? audioPlaybackStatus === "blocked" ? "已连接 · 音频播放受限"
+      ? audioPlaybackStatus === "blocked" ? "已连接 · 点击扬声器恢复播放"
         : audioPlaybackStatus === "error" ? "已连接 · 音频播放失败"
           : audioPlaybackStatus === "ready" ? "已连接 · 音频回传已就绪"
             : "已连接 · 等待 GPT 音频"
-      : mediaStatus === "connecting" ? "正在恢复连接" : "连接已中断 · 按住说话重连";
+      : mediaStatus === "connecting" ? "正在恢复连接" : "连接已中断 · 请重新连接设备";
     return (
       <main className="shell session-shell">
         <header className="session-header">
@@ -828,31 +915,13 @@ export default function Home() {
         </header>
         <p className="connection-line"><span className={mediaStatus === "connected" ? "online-dot" : "offline-dot"} /> {connectionStatus}</p>
         <section className="voice-stage">
-          <div
-            className="transcript-list"
-            ref={contentListRef}
-            aria-live="polite"
-            aria-label="对话记录"
-            onScroll={(event) => {
-              if (event.currentTarget.scrollTop < 72) requestOlderContent();
-            }}
-          >
-            {historyLoading && <p className="history-loading"><LoaderCircle className="spin" /> 正在加载更早内容</p>}
-            {contentItems.length === 0 && <p className="transcript-empty">开始说话后，对话文字会显示在这里</p>}
-            {contentItems.map((entry) => (
-              <article className={`bubble ${entry.role}`} key={entry.id}>
-                {entry.kind === "text" && entry.text
-                  ? entry.text
-                  : <span className="unsupported-content">暂不支持此内容</span>}
-              </article>
-            ))}
-          </div>
+          <div className="voice-space" aria-hidden />
           <div className="voice-controls" ref={voiceControlsRef}>
-            <p className="voice-status">{talking ? "正在发送" : replyActive ? "GPT 正在回复" : "按住说话"}</p>
+            <p className="voice-status">{replyActive ? "GPT 正在回复" : talking ? "正在发送" : "按住说话"}</p>
             <div className={`voice-dots ${talking || replyActive ? "active" : ""}`} aria-hidden>
               {waveLevels.map((level, index) => <i key={index} style={{ height: `${8 + level * 28}px` }} />)}
             </div>
-            <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={handlePointerDown} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onLostPointerCapture={handlePointerUp} onContextMenu={(event) => event.preventDefault()}>
+            <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={startTalking} onPointerUp={stopTalking} onPointerCancel={stopTalking} onLostPointerCapture={stopTalking} onContextMenu={(event) => event.preventDefault()}>
               <Mic />
             </button>
           </div>

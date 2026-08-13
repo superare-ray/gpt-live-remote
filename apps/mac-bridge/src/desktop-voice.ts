@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -68,23 +70,6 @@ export async function desktopPreflight(bundleId: string): Promise<DesktopPreflig
   };
 }
 
-const shortcutScript = String.raw`
-on run argv
-  set appBundleId to item 1 of argv
-  set shortcutKey to item 2 of argv
-  tell application "System Events"
-    set targetProcess to first application process whose bundle identifier is appBundleId
-    set frontmost of targetProcess to true
-    delay 0.25
-    if shortcutKey is "space" then
-      keystroke " " using {__MODIFIERS__}
-    else
-      keystroke shortcutKey using {__MODIFIERS__}
-    end if
-  end tell
-end run
-`;
-
 const snapshotScript = String.raw`
 on run argv
   set appBundleId to item 1 of argv
@@ -111,17 +96,67 @@ export async function readAccessibilitySnapshot(bundleId: string) {
 }
 
 async function triggerShortcut(config: DesktopVoiceConfig) {
-  await execFileAsync("/usr/bin/open", ["-b", config.bundleId]);
+  // The realtimeVoice command is OS-global. Keep the user's current Codex
+  // surface intact instead of activating or navigating the app window.
+  await execFileAsync("/usr/bin/open", ["-g", "-b", config.bundleId]);
+  const script = resolve(dirname(fileURLToPath(import.meta.url)), "../native/audio-device.swift");
   const modifiers = ["command", "control", "option", "shift"]
     .filter((modifier) => config.shortcutModifiers.has(modifier as "command" | "control" | "option" | "shift"))
-    .map((modifier) => `${modifier} down`)
     .join(", ");
-  await execFileAsync("/usr/bin/osascript", [
-    "-e",
-    shortcutScript.replaceAll("__MODIFIERS__", modifiers),
-    config.bundleId,
-    config.shortcutKey,
-  ]);
+  // Electron's global shortcut handler does not reliably receive AppleScript
+  // `keystroke` events. Post the physical key code through CoreGraphics.
+  await execFileAsync("/usr/bin/swift", [script, "send-hotkey", config.shortcutKey, modifiers]);
+}
+
+type AudioProcessState = { input: boolean; output: boolean; pids: number[] };
+
+async function readAudioProcessState(bundleId: string): Promise<AudioProcessState> {
+  const script = resolve(dirname(fileURLToPath(import.meta.url)), "../native/audio-device.swift");
+  const { stdout } = await execFileAsync("/usr/bin/swift", [script, "process-io", bundleId]);
+  return JSON.parse(stdout) as AudioProcessState;
+}
+
+async function waitForVoiceInput(config: DesktopVoiceConfig, expected: boolean) {
+  const deadline = Date.now() + config.timeoutMs;
+  let consecutiveMatches = 0;
+  let lastState: AudioProcessState = { input: false, output: false, pids: [] };
+  while (Date.now() < deadline) {
+    lastState = await readAudioProcessState(config.bundleId);
+    consecutiveMatches = lastState.input === expected ? consecutiveMatches + 1 : 0;
+    if (consecutiveMatches >= 2) return lastState;
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+  throw new Error(expected ? "voice_audio_input_unverified" : "voice_audio_stop_unverified");
+}
+
+async function restartDesktopAudioService(appPath: string | null) {
+  if (!appPath) return [];
+  const { stdout } = await execFileAsync("/usr/bin/pgrep", ["-f", "utility-sub-type=audio.mojom.AudioService"])
+    .catch(() => ({ stdout: "", stderr: "" }));
+  const restarted: number[] = [];
+  for (const value of stdout.split("\n")) {
+    const pid = Number(value.trim());
+    if (!Number.isInteger(pid) || pid <= 1) continue;
+    const { stdout: command } = await execFileAsync("/bin/ps", ["-p", String(pid), "-o", "command="])
+      .catch(() => ({ stdout: "", stderr: "" }));
+    if (!command.includes(`${appPath}/Contents/Frameworks/`) || !command.includes("audio.mojom.AudioService")) continue;
+    process.kill(pid, "SIGTERM");
+    restarted.push(pid);
+  }
+  const deadline = Date.now() + 4_000;
+  while (restarted.length && Date.now() < deadline) {
+    const alive = restarted.some((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (!alive) return restarted;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return restarted;
 }
 
 export async function startAndVerifyVoice(config: DesktopVoiceConfig) {
@@ -129,62 +164,26 @@ export async function startAndVerifyVoice(config: DesktopVoiceConfig) {
   if (!preflight.appInstalled) throw new Error("chatgpt_app_not_found");
   if (!preflight.accessibilityEnabled) throw new Error("accessibility_permission_missing");
 
-  if (config.activePattern) {
-    const currentSnapshot = await readAccessibilitySnapshot(config.bundleId);
-    if (config.activePattern.test(currentSnapshot)) {
-      // A Voice window left over from an earlier remote session can retain the
-      // old CoreAudio devices. Close it first so the next start reacquires the
-      // BlackHole defaults selected by the media bridge.
-      await triggerShortcut(config);
-      const stopDeadline = Date.now() + config.timeoutMs;
-      let consecutiveStops = 0;
-      while (Date.now() < stopDeadline) {
-        const snapshot = await readAccessibilitySnapshot(config.bundleId);
-        consecutiveStops = config.activePattern.test(snapshot) ? 0 : consecutiveStops + 1;
-        if (consecutiveStops >= 2) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-      if (consecutiveStops < 2) throw new Error("voice_ui_stop_unverified");
-    }
+  const currentAudio = await readAudioProcessState(config.bundleId);
+  if (currentAudio.input) {
+    // Tear down any previous Voice input stream so the next start reacquires
+    // the BlackHole default selected for this remote session.
+    await triggerShortcut(config);
+    await waitForVoiceInput(config, false);
   }
+  // Chromium's audio utility process can retain the device selected before the
+  // Bridge changed the system default. Recreate only that helper (not the app)
+  // so the next Voice input stream binds to the current BlackHole default.
+  await restartDesktopAudioService(preflight.appPath);
   await triggerShortcut(config);
-  const deadline = Date.now() + config.timeoutMs;
-  if (!config.activePattern) {
-    // Electron currently exposes Voice state inside its renderer rather than the
-    // native AX tree. We can still verify the app's audio service transition.
-    while (Date.now() < deadline) {
-      const { stdout } = await execFileAsync("/usr/bin/pgrep", ["-f", "utility-sub-type=audio.mojom.AudioService"]).catch(() => ({ stdout: "", stderr: "" }));
-      if (stdout.trim()) return { verified: true, preflight };
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    throw new Error("voice_audio_service_unverified");
-  }
-  let consecutiveMatches = 0;
-  while (Date.now() < deadline) {
-    const snapshot = await readAccessibilitySnapshot(config.bundleId);
-    consecutiveMatches = config.activePattern.test(snapshot) ? consecutiveMatches + 1 : 0;
-    if (consecutiveMatches >= 2) return { verified: true, preflight };
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error("voice_ui_state_unverified");
+  const audio = await waitForVoiceInput(config, true);
+  return { verified: true, preflight, audio };
 }
 
 export async function stopAndVerifyVoice(config: DesktopVoiceConfig) {
-  if (config.activePattern) {
-    const currentSnapshot = await readAccessibilitySnapshot(config.bundleId);
-    if (!config.activePattern.test(currentSnapshot)) return { verified: true };
-  }
-
+  const currentAudio = await readAudioProcessState(config.bundleId);
+  if (!currentAudio.input) return { verified: true, audio: currentAudio };
   await triggerShortcut(config);
-  if (!config.activePattern) return { verified: false };
-
-  const deadline = Date.now() + config.timeoutMs;
-  let consecutiveStops = 0;
-  while (Date.now() < deadline) {
-    const snapshot = await readAccessibilitySnapshot(config.bundleId);
-    consecutiveStops = config.activePattern.test(snapshot) ? 0 : consecutiveStops + 1;
-    if (consecutiveStops >= 2) return { verified: true };
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  throw new Error("voice_ui_stop_unverified");
+  const audio = await waitForVoiceInput(config, false);
+  return { verified: true, audio };
 }

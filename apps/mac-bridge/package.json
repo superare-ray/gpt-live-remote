@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build:native": "sh scripts/build-native.sh",
     "dev": "tsx src/index.ts",
     "diagnose": "tsx src/diagnose.ts",
-    "build": "tsc -p tsconfig.json",
+    "test:e2e-audio": "tsx src/e2e-audio-test.ts",
+    "build": "npm run build:native && tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

@@ -1,0 +1,194 @@
+# Codex Live Remote 已知故障库
+
+本目录记录可复用的故障知识，不承担产品与架构定义；权威工程约束见根目录 [`AGENTS.md`](../../AGENTS.md)。每次出现新问题时，必须先按症状、边界和日志关键词检索本文件，再决定是否复用已有处理。
+
+## 状态定义
+
+- **用户已确认**：用户在真实手机、真实网络和 Codex Voice 中确认结果。
+- **边界已确认**：通过不创建媒体会话的静态检查、日志或 HTTP/进程边界检查确认；不代表端到端语音通过。
+- **已实施待复验**：代码或配置已部署，但用户尚未完成真实设备复验。
+- **诊断规则**：已经确认的事实或排查约束，不代表一个独立修复。
+
+构建、typecheck、进程存活、UI 波形、连接音和模拟音频都不得提升为“用户已确认”。
+
+## 快速索引
+
+| ID | 症状 | 根因边界 | 状态 |
+| --- | --- | --- | --- |
+| KI-001 | 网页提示重定向次数过多 | Nginx ↔ 前端规范路径 | 边界已确认 |
+| KI-002 | Voice 快捷键触发后仍无 Codex 输入 | Bridge → Codex Voice | 边界已确认 |
+| KI-003 | 没有主动问候，被误判为未连接 | Voice 状态判定 | 诊断规则 |
+| KI-004 | 有效音频爆裂、失真，静音干净 | 旧 FFmpeg/设备身份/队列链路 | 用户已确认改善 |
+| KI-005 | 初始音后下行不再返回 | CoreAudio capture → LiveKit | 已实施待复验 |
+| KI-006 | 手机与 Mac 同时播放同一声音 | process tap 本地播放语义 | 已实施待复验 |
+| KI-007 | 断开重连后按住说话无波形/无上行 | 浏览器 track 生命周期 | 已实施待复验 |
+| KI-008 | 刷新后页面卡住、回设备页或状态错误 | 页面恢复/控制与媒体生命周期 | 已实施待复验 |
+| KI-009 | 第一段能传，间隔后第二段不能传 | PTT 错误销毁或重建轨道 | 已实施待复验 |
+| KI-010 | 本人声音回到手机，Codex 被自身回复干扰 | Bridge playout 被 system tap 回采 | 已实施待复验 |
+| KI-011 | 看似 E2E 通过，真实设备却未收到回复 | 把连接音当作回复 | 诊断规则 |
+| KI-012 | 多个 Bridge、aggregate 或 helper 遗留 | 资源所有权与退出路径 | 已实施待复验 |
+
+## KI-001：子路径发生 308 重定向循环
+
+**症状**
+
+- 手机和电脑访问 `https://8.137.116.27:9443/gpt-live-remote` 时提示“重定向的次数过多”。
+- 不带尾斜杠返回到带尾斜杠；带尾斜杠又返回到不带尾斜杠。
+
+**证据与根因**
+
+- Nginx 的 exact location 曾执行 `return 308 /gpt-live-remote/`。
+- 当前 vinext 前端对 `/gpt-live-remote/` 返回 `Location: /gpt-live-remote`，且实际页面由上游根路径 `/` 提供。
+- 两层同时规范化路径造成永久循环；仅删除一侧重定向会进一步暴露 404。
+
+**处理方式**
+
+- Nginx 同时接受带和不带尾斜杠的公网路径，并在反向代理时去除 `/gpt-live-remote` 前缀交给 `127.0.0.1:8790/`。
+- 保留 `/gpt-live-remote/api/` 的 Control API 专用 location，不得让它落入前端代理。
+- 修改后先执行 `nginx -t`，再 reload，仅更新项目 vhost。
+
+**验证**
+
+- 2026-08-13：公网带/不带尾斜杠均为 HTTP 200、0 次重定向；核心 `/_next` JS 为 HTTP 200。状态为“边界已确认”，等待用户再次确认手机实际加载。
+
+## KI-002：Voice 快捷键没有打开 Codex 输入
+
+**症状**
+
+- WebRTC、BlackHole 和 Bridge 已就绪，但连接最终失败或出现 `voice_audio_input_unverified`。
+
+**根因**
+
+- AppleScript 发送 `Control+Shift+V` 没有触发 Codex 的全局 Voice chat hotkey。
+
+**已确认处理**
+
+- 使用 `audio-device.swift send-hotkey v control,shift` 通过 CoreGraphics HID 发送按键。
+- 用户已确认真实快捷键为 `Control+Shift+V`；不是 `Command+Control+V`。
+- 通过 `audio-device.swift process-io com.openai.codex` 验证输入状态，失败时精确报告，不得切换到 Chat 作为回退。
+
+## KI-003：Codex 未主动说话不代表未连接
+
+Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活动”判断启动成功；应检查 Codex CoreAudio process input、LiveKit 房间和各音频边界计数器。启动音、连接音也不是助手回复。
+
+## KI-004：旧实时链路在有声时爆裂、失真和 noise
+
+**症状与证据**
+
+- 静音完全干净，一旦出现有效音频就明显爆裂、失真或夹杂 noise。
+- 旧下行包含 CoreAudio aggregate → AVFoundation/FFmpeg → 任意 stdout chunk → `Buffer.concat` → Promise 队列 → LiveKit，并且曾存在两个同名 aggregate，按名称/index 可能选中旧设备。
+
+**已确认处理**
+
+- 生产上下行移除 FFmpeg，改用原生 CoreAudio callback、固定 ring buffer 和进程内一次格式转换。
+- aggregate 使用唯一 UID，原生层按 UID/AudioObjectID 绑定；下行保持 48 kHz stereo，并显式设置 Opus bitrate 与 `dtx=false`。
+- 不添加降噪或 gain 掩盖格式、时钟和设备身份问题。
+
+**验证**
+
+- 用户真实听感确认“声音音质好太多了，之前各种 noise”。该确认仅覆盖音质明显改善，不代表重连、长连接和双向语音全部通过。
+
+## KI-005：只听到初始连接音，后续无返回音频
+
+**可能命中的已实施根因**
+
+- capture pump 在 `AudioSource` 尚未就绪时提前永久退出，后续即使 CoreAudio 已有帧也不再提交 LiveKit。
+
+**已实施处理**
+
+- capture pump 在 source 暂未就绪时等待并继续；会话关闭才退出。
+- 下行单独使用 48 kHz stereo，记录 capture frames/peak、ring、submitted frames、浏览器 inbound RTP 和 playback。
+
+**复验要求**
+
+- 必须由同一 session ID 证明 capture callback 有非静音帧、LiveKit submitted 增长、浏览器 inbound RTP 增长并实际播放。用户尚未复验，不得标记完成。
+
+## KI-006：Mac 与手机重复播放同一系统音频
+
+**根因与处理**
+
+- process tap 采用未静音语义时，系统音频既走本地设备又走远端。远程耳麦模式改为 `.mutedWhenTapped`，连接期间只由浏览器输出；断开后销毁 tap 并恢复原系统输出。
+
+**状态**
+
+- 已实施，等待用户真实设备复验。
+
+## KI-007：断开重连后麦克风轨道失效
+
+**症状**
+
+- 远端断开再连接后，长按按钮没有三点波形，Bridge 收到静音或 track 已 muted/ended；强刷后又可能无法连接。
+
+**处理方式**
+
+- 仅在同一健康媒体会话内复用一条 track 并执行 mute/unmute。
+- 终止性断开必须 stop 旧 track；新 session 必须重新调用 `createLocalAudioTrack`，不得复用上一 session 的 `MediaStreamTrack`。
+- 控制 WebSocket 短断只重连控制面，不能清理健康 Room。
+
+**状态**
+
+- 生命周期已实施，等待真实断开→重连→多轮 PTT 复验。
+
+## KI-008：刷新导致页面状态错误或持续 loading
+
+**处理方式**
+
+- 页面启动时从服务器读取 active session 与真实设备状态；有活动会话则恢复沟通页，没有才显示设备列表。
+- 服务器在最后一个手机控制连接消失后保留 10 分钟恢复窗口；返回时取消回收 timer。
+- 终止性控制关闭码才拆媒体；普通网络闪断仅重连控制 socket。
+
+**状态**
+
+- 已实施待复验。若表现为“网页无法打开/重定向过多”，先查 KI-001，不要归入会话恢复。
+
+## KI-009：第一段上行成功，间隔后第二段静音
+
+**根因模式与处理**
+
+- 松开 PTT 曾停止采集、轨道或发布，第二次需要重协商且容易失效。
+- 正确模型是在设备连接期间永久保持 Room、publication 和 Bridge PCM 搬运；PTT 只 mute/unmute。Bridge 不判断句首句尾。
+
+**状态**
+
+- 已实施待真实多轮和间隔复验。
+
+## KI-010：手机听见自己，或 Codex 被自己的回复干扰
+
+**根因与处理**
+
+- system process tap 若包含 Bridge 自身 phone playout，会把手机上行再次发回手机；Codex 回复也可能形成回路。
+- 创建 tap 时排除 Bridge 自身进程，且浏览器本地 analyser 只测量、不接 `AudioContext.destination`。
+
+**状态**
+
+- 已实施待复验。不要通过 AGC/降噪压制回路。
+
+## KI-011：连接音造成端到端假阳性
+
+2026-08-13 一次模拟运行把约 `-8.3 dBFS` 的返回当成助手回复，后来被真实设备观察推翻。以后返回观察窗口必须从用户有效上行开始，并结合助手实际响应时序；连接前或连接瞬间的提示音全部排除。E2E 工具、进程存活和音量峰值不能单独作为验收。
+
+## KI-012：会话后遗留进程、tap 或 aggregate
+
+**风险模式**
+
+- 通过 `tsx` 启动生产 Bridge 会产生多层或孤立进程。
+- 崩溃或不完整 teardown 可能遗留 aggregate、helper、默认音频设备和旧 Bridge socket，下一次会话连接到错误资源。
+
+**处理方式**
+
+- 生产只由 LaunchAgent 启动一个直接 Node `dist/index.js` 进程；服务器新 Bridge socket 替换旧 socket。
+- 每个 `MacAudioBridge` 资源只归属一个 session，所有失败和退出信号汇入幂等 `close()`。
+- 每次创建唯一 aggregate UID；启动前只清理项目 UID 前缀的遗留；销毁后记录设备已不存在，并恢复会话前系统默认设备。
+
+**状态**
+
+- 进程单实例与清理逻辑已实施；长连接、异常退出和连续重连仍需用户真实复验。
+
+## 新故障登记流程
+
+1. 用用户可见症状和日志关键词检索本文件；优先匹配相同故障边界，不只匹配相似文案。
+2. 用同一 session ID 找出最后一个有数据的边界和第一个无数据的边界。
+3. 只有证据与既有条目一致时才复用处理；否则新增 ID，禁止把新问题硬塞进旧结论。
+4. 记录：发生时间、版本/commit（如有）、真实设备与网络、症状、两侧计数器、根因、最小处理和回滚方式。
+5. 部署后先标记“已实施待复验”。用户真实设备确认后，才能改为“用户已确认”；HTTP、进程、静态构建等只能改为“边界已确认”。
+6. 若处理失效，在原条目追加反证并降级状态，不得保留虚假的“已确认”。
