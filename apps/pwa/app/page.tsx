@@ -99,6 +99,30 @@ function DeviceIcon({ kind }: { kind: DeviceKind }) {
   return <Laptop {...props} />;
 }
 
+type DevicePresentationTone = "connected" | "connecting" | "retained" | "connectable" | "unavailable";
+
+function devicePresentationStatus(options: {
+  device: Device;
+  selected: boolean;
+  session?: RemoteSession;
+  snapshot?: RuntimeSnapshot;
+  connecting: boolean;
+  reconnecting: boolean;
+}): { tone: DevicePresentationTone; label: string } {
+  const { device, selected, session, snapshot, connecting, reconnecting } = options;
+  if (device.status === "offline") return { tone: "unavailable", label: "不可用" };
+  if (!selected && session) return { tone: "retained", label: "后台保留" };
+  if (reconnecting) return { tone: "connecting", label: "正在重连" };
+  if (selected && snapshot?.mediaStatus === "failed") return { tone: "unavailable", label: "连接失败" };
+  if (selected && snapshot?.mediaStatus === "connected" && snapshot.voiceReady) {
+    return { tone: "connected", label: "已连接" };
+  }
+  if (selected && (connecting || Boolean(session) || snapshot?.mediaStatus === "connecting")) {
+    return { tone: "connecting", label: "连接中" };
+  }
+  return { tone: "connectable", label: "可连接" };
+}
+
 function isMicrophoneAccessError(error: unknown) {
   const candidate = error as { name?: string; message?: string };
   return candidate.name === "NotAllowedError"
@@ -792,34 +816,42 @@ export default function Home() {
     const snapshot = snapshots[activeDevice.id];
     const mediaConnected = snapshot?.mediaStatus === "connected";
     const voiceReady = snapshot?.voiceReady === true;
-    const connectionStatus = !snapshot || snapshot.mediaStatus === "connecting"
-      ? "正在连接"
-      : snapshot.mediaStatus === "failed"
-        ? snapshot.failure || "连接失败"
-        : !voiceReady
-          ? "音频已连接 · 正在启动 Codex Live"
-          : snapshot.playbackStatus === "blocked"
-            ? "已连接 · 浏览器暂未播放音频"
-            : snapshot.playbackStatus === "error"
-              ? "已连接 · 音频播放失败"
-              : "已连接";
+    const activeStatus = devicePresentationStatus({
+      device: activeDevice,
+      selected: true,
+      session: sessions[activeDevice.id],
+      snapshot,
+      connecting: connectingId === activeDevice.id,
+      reconnecting: connectingId === activeDevice.id && notice === "连接正在恢复",
+    });
     return (
       <main className="shell session-shell">
         <header className="session-header">
           <button className="icon-button session-back" type="button" onClick={openDeviceManager} aria-label="返回设备管理"><ArrowLeft /></button>
           <div className="device-selector" ref={deviceMenuRef}>
             <button className="device-pill" type="button" onClick={toggleDeviceMenu} aria-haspopup="listbox" aria-expanded={deviceMenuOpen}>
-              <DeviceIcon kind={activeDevice.kind} /><span className={mediaConnected ? "online-dot" : "offline-dot"} /><strong>{activeDevice.name}</strong><ChevronDown />
+              <DeviceIcon kind={activeDevice.kind} />
+              <span className={`device-status-dot ${activeStatus.tone}`} aria-hidden />
+              <span className="device-pill-copy"><strong>{activeDevice.name}</strong><small>{activeStatus.label}</small></span>
+              <ChevronDown />
             </button>
             {deviceMenuOpen && (
               <div className="device-dropdown" role="listbox" aria-label="切换设备">
-                {devices.filter((device) => device.status === "online").map((device) => {
+                {devices.map((device) => {
                   const selected = device.id === activeDevice.id;
-                  const connected = Boolean(sessions[device.id]);
+                  const status = devicePresentationStatus({
+                    device,
+                    selected,
+                    session: sessions[device.id],
+                    snapshot: snapshots[device.id],
+                    connecting: connectingId === device.id,
+                    reconnecting: selected && connectingId === device.id && notice === "连接正在恢复",
+                  });
                   return (
-                    <button className="device-option" type="button" role="option" aria-selected={selected} key={device.id} disabled={selected} onClick={() => void connectDevice(device)}>
+                    <button className="device-option" type="button" role="option" aria-selected={selected} key={device.id} disabled={selected || status.tone === "unavailable"} onClick={() => void connectDevice(device)}>
                       <span className="device-option-icon"><DeviceIcon kind={device.kind} /></span>
-                      <span><strong>{device.name}</strong><small>{selected ? "当前设备" : connected ? "已连接" : "在线"}</small></span>
+                      <span className={`device-status-dot ${status.tone}`} aria-hidden />
+                      <span className="device-option-copy"><strong>{device.name}</strong><small>{status.label}</small></span>
                       {selected && <Check aria-hidden />}
                     </button>
                   );
@@ -831,7 +863,6 @@ export default function Home() {
             <button className="icon-button" type="button" onClick={toggleAudioOutputMute} aria-pressed={audioOutputMuted} aria-label={audioOutputMuted ? "恢复回传音频" : "静音回传音频"}>{audioOutputMuted ? <VolumeX /> : <Volume2 />}</button>
           </div>
         </header>
-        <p className="connection-line"><span className={mediaConnected ? "online-dot" : "offline-dot"} /> {connectionStatus}</p>
         <section className="voice-stage">
           <div className="voice-space" aria-hidden />
           {mediaConnected && (
