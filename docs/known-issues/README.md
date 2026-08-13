@@ -7,6 +7,7 @@
 - **用户已确认**：用户在真实手机、真实网络和 Codex Voice 中确认结果。
 - **边界已确认**：通过不创建媒体会话的静态检查、日志或 HTTP/进程边界检查确认；不代表端到端语音通过。
 - **已实施待复验**：代码或配置已部署，但用户尚未完成真实设备复验。
+- **已知待修复**：根因和临时恢复方式已确认，但代码层仍缺少可靠自愈。
 - **诊断规则**：已经确认的事实或排查约束，不代表一个独立修复。
 
 构建、typecheck、进程存活、UI 波形、连接音和模拟音频都不得提升为“用户已确认”。
@@ -28,6 +29,8 @@
 | KI-011 | 看似 E2E 通过，真实设备却未收到回复 | 把连接音当作回复 | 诊断规则 |
 | KI-012 | 多个 Bridge、aggregate 或 helper 遗留 | 资源所有权与退出路径 | 已实施待复验 |
 | KI-013 | 忘记授权麦克风时只显示连接超时 | 浏览器权限 → 媒体创建 | 已实施待复验 |
+| KI-014 | 切换 Mac 后两台设备仍参与收发音频 | 账号会话租约与 LiveKit 房间隔离 | 用户已确认 |
+| KI-015 | Bridge 进程存活但设备长期显示离线 | Control WebSocket 1006 后未自愈 | 已知待修复 |
 
 ## KI-001：子路径发生 308 重定向循环
 
@@ -201,6 +204,40 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 **状态**
 
 - 已实施待真实权限拒绝→重新授权→连接复验。
+
+## KI-014：切换 Mac 后旧设备仍参与双向音频
+
+**症状与证据**
+
+- 从 Raymond 切换到 Mono 后，数据库中的 Raymond 会话虽已标记 stopped，但旧 Raymond Bridge 没有收到 `session.stop`，旧 LiveKit room 与发布/订阅管线仍存活。
+- 旧实现只按目标 `device_id` 结束会话，账号绑定的另一台 Mac 因而可以继续参与媒体，造成上下行跨设备泄漏。
+
+**已实施处理**
+
+- Control API 改为账号级单一媒体租约；新会话创建前，先认领该账号全部 `starting`/`ready`/`stopping` 会话，关闭旧手机控制 socket，向准确的旧 Bridge 发送 `session.stop` 并等待确认。
+- SQLite 使用 `remote_sessions_one_active_per_user` 部分唯一索引作为并发兜底；旧租约未完全释放时拒绝创建新会话。
+- LiveKit token 锁定 session UUID 房间和角色：phone 只可发布 `MICROPHONE`，Bridge 只可发布 `SCREEN_SHARE_AUDIO`，且禁止 data publication。
+
+**验证**
+
+- 2026-08-13：Control API typecheck/build、遗留重复数据迁移、唯一索引并发约束、线上源码校验和与服务健康边界均已确认；未主动创建媒体会话。
+- 2026-08-13：用户随后明确确认多设备/音频链路稳定，因此账号级单租约隔离提升为“用户已确认”。
+
+## KI-015：Bridge 进程存活但 Control WebSocket 已死亡
+
+**症状与证据**
+
+- `工作室 Mac mini Raymond` 曾显示不可用；LaunchAgent 与 Node PID 均存活，但进程没有 TCP socket，日志最后事件为 Control WebSocket `1006`。
+- 因主进程未退出，LaunchAgent 不会重新拉起它；这不是前端版本不同步。
+
+**当前恢复方式**
+
+- 仅在对应 Mac 上执行该 Bridge LaunchAgent 的 `kickstart -k`。2026-08-13 的操作恢复了单一 Node 进程、到 `8.137.116.27:9443` 的 ESTABLISHED 连接及设备注册；`MEDIA_ONLY_MODE=true` 保持不变，未触发 Voice。
+- 用户确认多设备链路稳定后，Raymond 的 `MEDIA_ONLY_MODE` 已独立改为 `false` 并只重载该 Bridge；该配置变更没有创建媒体会话或触发 Voice，也不改变本条尚未修复的 1006 自愈缺口。
+
+**未完成项**
+
+- Bridge 尚未实现 Control WebSocket 1006 后的进程内有界重连或明确退出交给 LaunchAgent 自愈。再次出现时先检查 PID、TCP socket 与最后关闭码，禁止通过重启服务器或 Codex 掩盖。
 
 ## 新故障登记流程
 

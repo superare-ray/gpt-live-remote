@@ -9,7 +9,7 @@
 - 当前 MVP 只交付稳定的双向实时语音与设备连接。不得自行扩展音频转写、文字注入、Codex App Server、任务生命周期、Hooks、远程审批或其他智能体能力。
 - 桌面目标是 **Codex Desktop / Codex Voice**，bundle identifier 为 `com.openai.codex`。当前应用路径 `/Volumes/storage/Applications/ChatGPT.app` 以及代码中的 GPT/ChatGPT 历史命名不改变产品目标。
 - Bridge 不是智能体：不得读取 Codex 任务，不得使用 OpenAI API、Cookie 或 API Key，不得接管 Codex 账号或任务生命周期。
-- 单个浏览器客户端同一时刻只连接一个目标 Mac；每台 Mac 同一时刻只保留一个有效远程媒体会话。账号可绑定并展示多台设备。
+- 单个浏览器客户端同一时刻只连接一个目标 Mac；一个账号同一时刻只拥有一个双向媒体会话。账号可绑定并展示多台设备，切换目标 Mac 时必须先完整停止旧设备会话，再创建新设备会话。
 
 ## 2. 权威架构
 
@@ -32,6 +32,7 @@
 - LiveKit：服务器 `127.0.0.1:7880`，经公网 `/rtc` 与已配置媒体端口提供服务
 - Mac Bridge LaunchAgent：`/Users/mono01/Library/LaunchAgents/com.gpt-live-remote.bridge.plist`
 - Mac Bridge 生产命令：`/Volumes/storage/home/.hermes/node/bin/node /Volumes/storage/Projects/Codex Live/apps/mac-bridge/dist/index.js`
+- 当前账号已登记两台完整 Voice 模式 Bridge：`工作室 MacMini Mono01` 使用 `/Users/mono01/Library/LaunchAgents/com.gpt-live-remote.bridge.plist`；`工作室 Mac mini Raymond` 使用 `/Users/raymond/Library/LaunchAgents/com.gpt-live-remote.bridge.plist`。两者 `MEDIA_ONLY_MODE` 均为 false；设备在线状态以 Control API 实时状态为准。
 - 服务器上的项目 Nginx 必须使用独立 access/error log；不得停止或修改阿里云上任何无关服务。
 
 ## 3. 核心技术决策
@@ -60,7 +61,8 @@
 ### 4.2 服务器会话
 
 - 每台设备只允许一个有效 Bridge WebSocket；新连接替换旧连接。旧连接的迟到 `ready`/`failed` 不得复活已经停止的会话。
-- 每个设备只允许一个 starting/ready 会话。新启动必须明确终止或替换旧会话，不能产生并行媒体所有者。
+- 每个账号只允许一个 `starting`/`ready`/`stopping` 媒体租约，并由数据库部分唯一索引兜底。新启动必须先关闭旧手机控制 socket，向旧会话所属的准确 Bridge 发送 `session.stop` 并等待停止确认；旧会话未释放时不得签发新房间 token。
+- LiveKit token 必须同时锁定 session UUID 房间、参与者角色与可发布 source：phone 只发布 `MICROPHONE`，Bridge 只发布 `SCREEN_SHARE_AUDIO`，双方不得发布 data。
 - Bridge 断开时，仍处于 starting/ready 的会话必须被标记 stopped。
 - 手机控制连接暂时归零时保留媒体会话，进入 10 分钟恢复窗口；手机重新连接即取消回收计时。窗口到期仍无客户端时，服务器标记 stopped、通知 Bridge，并关闭该会话的剩余手机 socket。
 - 显式断开不进入恢复窗口，立即向 Bridge 下发 stop；重复 stop 必须幂等。
@@ -92,7 +94,8 @@
 - 语音按钮是常驻底部的圆形 floating icon button；长按区域与相关文本禁止选择。按住时三点波形必须来自同一真实输入电平，且限制最大高度。
 - 图标按钮无外框、点击反馈一致、图标视觉尺寸一致，不增加单独的“启用音频”页面或按钮。
 - Live 页顶部设备名称只打开在线设备 source dropdown；选择另一设备时先完整停止当前 session，再建立新 session。返回设备管理使用独立的回退按钮，不得复用设备下拉或整页跳转。
-- 音频输出按钮优先调用浏览器标准 `selectAudioOutput`/`setSinkId` 选择系统暴露的扬声器、听筒或蓝牙设备；浏览器不支持时明确交由手机系统音频面板管理，禁止展示不能实际生效的伪设备选项。
+- 浏览器只保留下行静音/恢复按钮；扬声器、听筒与蓝牙的真实路由交由手机系统管理。不得展示目标移动浏览器不能可靠执行的 `selectAudioOutput`/`setSinkId` 伪切换入口。
+- 不根据音频电平推断并展示“Codex 正在回复”等状态；居中的三点指示器只表达当前真实音频电平，PTT 只显示“按住说话”或“正在发送”。
 - 麦克风未授权、拒绝或授权等待超时必须与媒体连接超时区分；先回收失败 session，再由新的用户手势重新请求权限，成功后创建全新的正式会话。
 - 已连接设备显示“已连接”并可断开；用户主动断开不显示“连接已断开，请重新连接设备”。刷新或恢复后仍停留在与服务器真实会话相符的页面。
 - 面向普通用户只显示可行动的连接/权限/播放错误，不展示内部协议、计数器或诊断噪声。

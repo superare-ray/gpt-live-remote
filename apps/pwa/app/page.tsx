@@ -14,6 +14,7 @@ import {
   Server,
   Square,
   Volume2,
+  VolumeX,
   Waves,
 } from "lucide-react";
 import { FormEvent, PointerEvent as ReactPointerEvent, useCallback, useEffect, useRef, useState } from "react";
@@ -37,12 +38,6 @@ type RemoteSession = {
 type WaveLevels = [number, number, number];
 type AudioPlaybackStatus = "idle" | "waiting" | "ready" | "blocked" | "error";
 type MicrophoneRecovery = { device: Device; message: string };
-type SelectableMediaDevices = MediaDevices & {
-  selectAudioOutput?: (options?: { deviceId?: string }) => Promise<MediaDeviceInfo>;
-};
-type SinkSelectableAudio = HTMLAudioElement & {
-  setSinkId?: (deviceId: string) => Promise<void>;
-};
 type ClientMediaStage =
   | "microphone_published"
   | "ptt_unmute_requested"
@@ -133,9 +128,7 @@ export default function Home() {
   const [deviceMenuOpen, setDeviceMenuOpen] = useState(false);
   const [microphoneRecovery, setMicrophoneRecovery] = useState<MicrophoneRecovery | null>(null);
   const [requestingMicrophone, setRequestingMicrophone] = useState(false);
-  const [selectingAudioOutput, setSelectingAudioOutput] = useState(false);
-  const [audioOutputLabel, setAudioOutputLabel] = useState("跟随手机系统");
-  const [audioOutputHint, setAudioOutputHint] = useState<string | null>(null);
+  const [audioOutputMuted, setAudioOutputMuted] = useState(false);
   const [talking, setTalking] = useState(false);
   const [replying, setReplying] = useState(false);
   const [mediaStatus, setMediaStatus] = useState<"idle" | "connecting" | "connected">("idle");
@@ -154,6 +147,7 @@ export default function Home() {
   const talkingRef = useRef(false);
   const activePointerRef = useRef<number | null>(null);
   const remotePlaybackAllowedRef = useRef(false);
+  const audioOutputMutedRef = useRef(false);
   const controlSocketRef = useRef<WebSocket | null>(null);
   const controlSessionRef = useRef<string | null>(null);
   const controlHeartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -536,7 +530,7 @@ export default function Home() {
         const audioElement = remoteAudioElementRef.current;
         if (audioElement) {
           track.attach(audioElement);
-          audioElement.muted = !remotePlaybackAllowedRef.current;
+          audioElement.muted = !remotePlaybackAllowedRef.current || audioOutputMutedRef.current;
           audioElement.volume = 1;
           void room.startAudio()
             .then(() => audioElement.play())
@@ -778,7 +772,7 @@ export default function Home() {
     if (audioContextRef.current) operations.push(audioContextRef.current.resume());
     if (room) operations.push(room.startAudio());
     if (audioElement?.srcObject) {
-      audioElement.muted = !remotePlaybackAllowedRef.current;
+      audioElement.muted = !remotePlaybackAllowedRef.current || audioOutputMutedRef.current;
       audioElement.volume = 1;
       operations.push(audioElement.play());
     }
@@ -800,29 +794,14 @@ export default function Home() {
     });
   }
 
-  async function chooseAudioOutput() {
-    if (selectingAudioOutput) return;
-    setSelectingAudioOutput(true);
-    setNotice(null);
-    setAudioOutputHint(null);
-    resumeRemoteAudio();
-    try {
-      const mediaDevices = navigator.mediaDevices as SelectableMediaDevices;
-      const audioElement = remoteAudioElementRef.current as SinkSelectableAudio | null;
-      if (!mediaDevices.selectAudioOutput || !audioElement?.setSinkId) {
-        setAudioOutputLabel("跟随手机系统");
-        setAudioOutputHint("当前浏览器由手机系统管理音频输出，请从系统音频面板切换扬声器、听筒或蓝牙设备");
-        return;
-      }
-      const selected = await mediaDevices.selectAudioOutput();
-      await audioElement.setSinkId(selected.deviceId);
-      setAudioOutputLabel(selected.label || "已选择音频输出");
-      if (audioElement.srcObject) await audioElement.play();
-    } catch (error) {
-      if ((error as Error).name !== "NotAllowedError") setNotice("音频输出切换失败，请重试");
-    } finally {
-      setSelectingAudioOutput(false);
-    }
+  function toggleAudioOutputMute() {
+    const muted = !audioOutputMutedRef.current;
+    audioOutputMutedRef.current = muted;
+    setAudioOutputMuted(muted);
+    const audioElement = remoteAudioElementRef.current;
+    if (!audioElement) return;
+    audioElement.muted = muted || !remotePlaybackAllowedRef.current;
+    if (!muted) resumeRemoteAudio();
   }
 
   function toggleDeviceMenu() {
@@ -837,6 +816,15 @@ export default function Home() {
     setDeviceMenuOpen(false);
     setShowDeviceManager(true);
     void loadDevices().catch(() => null);
+  }
+
+  function selectManagedDevice(device: Device) {
+    if (remoteSession?.deviceId === device.id) {
+      setShowDeviceManager(false);
+      resumeRemoteAudio();
+      return;
+    }
+    if (device.status === "online") void connectDevice(device);
   }
 
   function startTalking(event: ReactPointerEvent<HTMLButtonElement>) {
@@ -929,7 +917,7 @@ export default function Home() {
     view.setUint32(40, sampleCount * 2, true);
     const url = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
     audioElement.src = url;
-    audioElement.muted = false;
+    audioElement.muted = audioOutputMutedRef.current;
     void audioElement.play().catch(() => null).finally(() => {
       window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
     });
@@ -1035,7 +1023,7 @@ export default function Home() {
   if (activeDevice && remoteSession && !showDeviceManager) {
     const replyActive = replying;
     const connectionStatus = mediaStatus === "connected"
-      ? audioPlaybackStatus === "blocked" ? "已连接 · 点击扬声器恢复播放"
+      ? audioPlaybackStatus === "blocked" ? "已连接 · 浏览器暂未播放音频"
         : audioPlaybackStatus === "error" ? "已连接 · 音频播放失败"
           : audioPlaybackStatus === "ready" ? "已连接 · 音频回传已就绪"
             : "已连接 · 等待 GPT 音频"
@@ -1065,23 +1053,22 @@ export default function Home() {
             )}
           </div>
           <div className="session-actions">
-            <button className={`icon-button ${audioPlaybackStatus === "blocked" || audioPlaybackStatus === "error" ? "attention" : ""}`} type="button" disabled={selectingAudioOutput} onClick={() => void chooseAudioOutput()} aria-label={`切换音频输出，当前${audioOutputLabel}`} title={`切换音频输出 · ${audioOutputLabel}`}>{selectingAudioOutput ? <LoaderCircle className="spin" /> : <Volume2 />}</button>
+            <button className="icon-button" type="button" onClick={toggleAudioOutputMute} aria-pressed={audioOutputMuted} aria-label={audioOutputMuted ? "恢复回传音频" : "静音回传音频"} title={audioOutputMuted ? "恢复回传音频" : "静音回传音频"}>{audioOutputMuted ? <VolumeX /> : <Volume2 />}</button>
           </div>
         </header>
         <p className="connection-line"><span className={mediaStatus === "connected" ? "online-dot" : "offline-dot"} /> {connectionStatus}</p>
         <section className="voice-stage">
           <div className="voice-space" aria-hidden />
+          <div className={`voice-dots ${talking || replyActive ? "active" : ""}`} aria-hidden>
+            {waveLevels.map((level, index) => <i key={index} style={{ height: `${8 + level * 28}px` }} />)}
+          </div>
           <div className="voice-controls" ref={voiceControlsRef}>
-            <p className="voice-status">{replyActive ? "GPT 正在回复" : talking ? "正在发送" : "按住说话"}</p>
-            <div className={`voice-dots ${talking || replyActive ? "active" : ""}`} aria-hidden>
-              {waveLevels.map((level, index) => <i key={index} style={{ height: `${8 + level * 28}px` }} />)}
-            </div>
+            <p className="voice-status">{talking ? "正在发送" : "按住说话"}</p>
             <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={startTalking} onPointerUp={stopTalking} onPointerCancel={stopTalking} onLostPointerCapture={stopTalking} onContextMenu={(event) => event.preventDefault()}>
               <Mic />
             </button>
           </div>
         </section>
-        {audioOutputHint && <p className="notice info session-notice">{audioOutputHint}</p>}
         {notice && <p className="notice error session-notice">{notice}</p>}
       </main>
     );
@@ -1092,7 +1079,6 @@ export default function Home() {
       <header className="title-row">
         <div><p className="eyebrow">GPT-Live Remote</p><h1>我的设备</h1><p>{remoteSession ? "管理已连接和可用设备" : "选择一台设备开始连接"}</p></div>
         <div className="title-actions">
-          {remoteSession && <button className="icon-button" onClick={() => setShowDeviceManager(false)} aria-label="返回当前会话"><ArrowLeft /></button>}
           <button className="icon-button" onClick={() => void loadDevices()} aria-label="刷新设备"><RefreshCw /></button>
         </div>
       </header>
@@ -1101,8 +1087,10 @@ export default function Home() {
           const isConnected = remoteSession?.deviceId === device.id;
           return (
             <article className={`device-card ${isConnected ? "connected" : ""}`} key={device.id}>
-              <div className="device-icon"><DeviceIcon kind={device.kind} /></div>
-              <div className="device-copy"><strong>{device.name}</strong><span><i className={device.status === "online" ? "online-dot" : "offline-dot"} /> {isConnected ? "当前已连接" : device.status === "online" ? "在线 · Bridge 已就绪" : "离线"}</span></div>
+              <button className="device-card-target" type="button" disabled={(!isConnected && device.status !== "online") || connectingId !== null || disconnecting} onClick={() => selectManagedDevice(device)} aria-label={isConnected ? `打开 ${device.name} 当前会话` : `连接 ${device.name}`}>
+                <span className="device-icon"><DeviceIcon kind={device.kind} /></span>
+                <span className="device-copy"><strong>{device.name}</strong><span><i className={device.status === "online" ? "online-dot" : "offline-dot"} /> {isConnected ? "当前已连接" : device.status === "online" ? "在线 · Bridge 已就绪" : "离线"}</span></span>
+              </button>
               <button className={`connect-button ${isConnected ? "disconnect" : ""}`} disabled={device.status !== "online" || connectingId !== null || disconnecting} onClick={() => isConnected ? void stopCurrentSession() : void connectDevice(device)}>
                 {connectingId === device.id || (isConnected && disconnecting) ? <LoaderCircle className="spin" aria-label={isConnected ? "正在断开" : "正在连接"} /> : isConnected ? "断开连接" : device.status === "online" ? "连接设备" : "不可用"}
               </button>

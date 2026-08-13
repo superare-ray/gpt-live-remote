@@ -62,8 +62,10 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .icon-button:not(:disabled):active { background: rgba(157,184,163,.14); }
 .icon-button.attention { color: #d7aaa5; }
 .device-list { display: grid; gap: 14px; }
-.device-card { display: grid; grid-template-columns: 58px minmax(0,1fr) auto; align-items: center; gap: 15px; padding: 18px; border-radius: 20px; border: 1px solid var(--border); background: rgba(13,25,19,.86); }
+.device-card { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 15px; padding: 18px; border-radius: 20px; border: 1px solid var(--border); background: rgba(13,25,19,.86); }
 .device-card.connected { border-color: rgba(120,165,134,.52); background: rgba(18,37,27,.92); }
+.device-card-target { min-width: 0; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; display: grid; grid-template-columns: 58px minmax(0,1fr); align-items: center; gap: 15px; }
+.device-card-target:disabled { opacity: 1; }
 .device-icon { width: 56px; height: 56px; display: grid; place-items: center; border-radius: 16px; background: rgba(157,184,163,.08); color: var(--sage-strong); }
 .device-icon svg { width: 31px; height: 31px; }
 .device-copy { display: grid; min-width: 0; gap: 7px; }
@@ -106,7 +108,7 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .device-option small { color: var(--muted); font-size: 12px; }
 .device-option > svg { width: 17px; height: 17px; color: var(--sage-strong); }
 .device-dropdown-empty { margin: 0; padding: 18px 12px; text-align: center; color: var(--muted); font-size: 13px; }
-.session-actions { display: flex; gap: 2px; }
+.session-actions { justify-self: end; display: flex; gap: 2px; }
 .connection-line { display: flex; align-items: center; gap: 7px; margin: 12px 2px 0; color: var(--muted); font-size: 13px; }
 .session-notice { margin-top: 18px; margin-bottom: 118px; }
 .voice-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 14px 0 18px; }
@@ -120,7 +122,7 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .voice-controls { position: fixed; z-index: 10; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); width: min(calc(100% - 32px), 488px); transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; pointer-events: none; }
 .voice-controls > :not(.ptt), .ptt > * { pointer-events: none; }
 .voice-status { min-height: 20px; margin: 0; color: var(--sage); font-size: 14px; }
-.voice-dots { height: 48px; width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px; margin: 5px 0 12px; }
+.voice-dots { position: fixed; z-index: 9; top: 50%; left: 50%; width: min(calc(100% - 32px), 488px); height: 48px; transform: translate(-50%, -50%); display: flex; align-items: center; justify-content: center; gap: 8px; pointer-events: none; }
 .voice-dots i { width: 8px; min-height: 8px; border-radius: 999px; background: var(--sage-strong); opacity: .42; box-shadow: 0 0 16px rgba(184,207,188,.1); transition: height 45ms linear, opacity 120ms ease; }
 .voice-dots.active i { opacity: .96; }
 .ptt { width: 86px; height: 86px; flex: 0 0 86px; padding: 0; border-radius: 50%; border: 1px solid rgba(184,207,188,.55); color: #07100d; background: var(--sage-strong); display: grid; place-items: center; pointer-events: auto; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; transition: transform 120ms ease, background-color 120ms ease, box-shadow 120ms ease; }
@@ -146,7 +148,8 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 
 @media (max-width: 390px) {
   .shell { padding-left: 16px; padding-right: 16px; }
-  .device-card { grid-template-columns: 48px minmax(0,1fr) auto; gap: 10px; padding: 14px; }
+  .device-card { gap: 10px; padding: 14px; }
+  .device-card-target { grid-template-columns: 48px minmax(0,1fr); gap: 10px; }
   .device-icon { width: 46px; height: 46px; }
   .connect-button { min-width: 82px; }
   .session-header { grid-template-columns: 40px minmax(0,1fr) 40px; gap: 2px; }
