@@ -1043,6 +1043,7 @@ export default function Home() {
     return (
       <main className="shell session-shell">
         <header className="session-header">
+          <button className="icon-button session-back" type="button" onClick={openDeviceManager} aria-label="返回设备管理" title="返回设备管理"><ArrowLeft /></button>
           <div className="device-selector" ref={deviceMenuRef}>
             <button className="device-pill" type="button" onClick={toggleDeviceMenu} aria-haspopup="listbox" aria-expanded={deviceMenuOpen}>
               <DeviceIcon kind={activeDevice.kind} /><span className="online-dot" /> <strong>{activeDevice.name}</strong><ChevronDown />
@@ -1064,7 +1065,6 @@ export default function Home() {
             )}
           </div>
           <div className="session-actions">
-            <button className="icon-button" type="button" onClick={openDeviceManager} aria-label="返回设备管理" title="返回设备管理"><ArrowLeft /></button>
             <button className={`icon-button ${audioPlaybackStatus === "blocked" || audioPlaybackStatus === "error" ? "attention" : ""}`} type="button" disabled={selectingAudioOutput} onClick={() => void chooseAudioOutput()} aria-label={`切换音频输出，当前${audioOutputLabel}`} title={`切换音频输出 · ${audioOutputLabel}`}>{selectingAudioOutput ? <LoaderCircle className="spin" /> : <Volume2 />}</button>
           </div>
         </header>
