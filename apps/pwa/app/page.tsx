@@ -872,9 +872,7 @@ export default function Home() {
           )}
           {voiceReady && mediaConnected && (
             <div className="voice-controls" ref={voiceControlsRef}>
-              <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={startTalking} onPointerUp={stopTalking} onPointerCancel={stopTalking} onLostPointerCapture={stopTalking} onContextMenu={(event) => event.preventDefault()}>
-                <Mic />
-              </button>
+              <button className={`ptt ${talking ? "pressed" : ""}`} type="button" aria-label={talking ? "松开发送" : "按住说话"} onPointerDown={startTalking} onPointerUp={stopTalking} onPointerCancel={stopTalking} onLostPointerCapture={stopTalking} onContextMenu={(event) => event.preventDefault()} />
             </div>
           )}
         </section>
