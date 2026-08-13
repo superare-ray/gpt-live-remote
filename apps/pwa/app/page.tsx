@@ -833,7 +833,7 @@ export default function Home() {
               <DeviceIcon kind={activeDevice.kind} />
               <span className={`device-status-dot ${activeStatus.tone}`} aria-hidden />
               <span className="device-pill-copy"><strong>{activeDevice.name}</strong><small>{activeStatus.label}</small></span>
-              <ChevronDown />
+              <ChevronDown className={`device-chevron ${deviceMenuOpen ? "open" : ""}`} />
             </button>
             {deviceMenuOpen && (
               <div className="device-dropdown" role="listbox" aria-label="切换设备">
