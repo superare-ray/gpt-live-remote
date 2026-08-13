@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Check,
   ChevronDown,
+  HardDrive,
   Laptop,
   LoaderCircle,
   LockKeyhole,
@@ -14,7 +15,6 @@ import {
   RefreshCw,
   Server,
   Smartphone,
-  Square,
   Tablet,
   Volume2,
   VolumeX,
@@ -92,10 +92,11 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 }
 
 function DeviceIcon({ kind }: { kind: DeviceKind }) {
-  if (kind === "phone") return <Smartphone aria-hidden />;
-  if (kind === "tablet") return <Tablet aria-hidden />;
-  if (kind === "macmini") return <Square aria-hidden />;
-  return <Laptop aria-hidden />;
+  const props = { "aria-hidden": true, strokeWidth: 1.5 } as const;
+  if (kind === "phone") return <Smartphone {...props} />;
+  if (kind === "tablet") return <Tablet {...props} />;
+  if (kind === "macmini") return <HardDrive {...props} />;
+  return <Laptop {...props} />;
 }
 
 function isMicrophoneAccessError(error: unknown) {
@@ -323,7 +324,8 @@ export default function Home() {
       setTalking(false);
       activePointerRef.current = null;
       clearReconnect(previousId);
-      void runtimesRef.current.get(previousId)?.setForeground(false);
+      const previousRuntime = runtimesRef.current.get(previousId);
+      if (previousRuntime) void previousRuntime.setForeground(false).catch(() => null);
     }
     // Selection is a synchronous UI action. Media handoff continues after the
     // Live page has already switched to the chosen device.
@@ -456,7 +458,8 @@ export default function Home() {
     showDeviceManagerRef.current = true;
     setShowDeviceManager(true);
     const activeId = activeDeviceIdRef.current;
-    if (activeId) void runtimesRef.current.get(activeId)?.setForeground(false);
+    const activeRuntime = activeId ? runtimesRef.current.get(activeId) : null;
+    if (activeRuntime) void activeRuntime.setForeground(false).catch(() => null);
     void Promise.all([loadDevices(), loadActiveSessions()]).catch(() => null);
   }
 
@@ -634,6 +637,19 @@ export default function Home() {
       document.removeEventListener("dragstart", prevent, true);
     };
   }, []);
+
+  useEffect(() => {
+    if (!activeDevice || showDeviceManager) return;
+    // A restored page may be blocked by mobile autoplay policy. Reuse the
+    // next normal user gesture anywhere on the Live page to resume the actual
+    // remote element; no separate "enable audio" control is required.
+    const resume = () => {
+      const runtime = runtimesRef.current.get(activeDevice.id);
+      if (runtime) void runtime.resumePlayback().catch(() => null);
+    };
+    document.addEventListener("pointerdown", resume, true);
+    return () => document.removeEventListener("pointerdown", resume, true);
+  }, [activeDevice, showDeviceManager]);
 
   useEffect(() => {
     if (!activeDevice || showDeviceManager) return;

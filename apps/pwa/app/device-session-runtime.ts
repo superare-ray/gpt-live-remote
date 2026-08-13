@@ -131,6 +131,14 @@ export class DeviceSessionRuntime {
     this.emit();
   }
 
+  private setRemoteSubscription(subscribed: boolean) {
+    const publication = this.remotePublication;
+    if (!publication) return;
+    // LiveKit's setSubscribed API is synchronous and returns void. Do not
+    // treat it as a Promise: chaining .catch() here crashes device handoff.
+    publication.setSubscribed(subscribed);
+  }
+
   private createAudioElement() {
     const audio = document.createElement("audio");
     audio.autoplay = true;
@@ -392,7 +400,7 @@ export class DeviceSessionRuntime {
     this.foreground = foreground;
     if (!foreground) {
       await this.micTrack?.mute().catch(() => null);
-      if (this.remotePublication) await this.remotePublication.setSubscribed(false).catch(() => null);
+      this.setRemoteSubscription(false);
       if (this.audioElement) {
         this.audioElement.muted = true;
         this.audioElement.pause();
@@ -401,7 +409,7 @@ export class DeviceSessionRuntime {
       return;
     }
     if (this.remotePublication && !this.remotePublication.isSubscribed) {
-      await this.remotePublication.setSubscribed(true).catch(() => null);
+      this.setRemoteSubscription(true);
     } else if (this.remoteTrack) {
       this.attachAndPlay(this.remoteTrack);
     }
@@ -423,6 +431,9 @@ export class DeviceSessionRuntime {
     const operations: Promise<unknown>[] = [];
     if (this.audioContext) operations.push(this.audioContext.resume());
     if (this.room) operations.push(this.room.startAudio());
+    if (this.audioElement && this.remoteTrack && !this.audioElement.srcObject) {
+      this.remoteTrack.attach(this.audioElement);
+    }
     if (this.audioElement?.srcObject && !this.outputMuted && this.foreground) {
       this.audioElement.muted = this.outputMuted || !this.foreground;
       this.audioElement.volume = 1;

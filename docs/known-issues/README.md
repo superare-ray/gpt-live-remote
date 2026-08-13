@@ -312,6 +312,29 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 
 - 静态检查通过；尚未执行媒体、Voice 或真机交互测试，等待用户在 Mono、Raymond 与手机上复验。
 
+## KI-019：切回后台设备时报 `Cannot read properties of undefined (reading 'catch')`
+
+**症状**
+
+- 从另一台设备切回 Mono01 时，前端抛出 `Cannot read properties of undefined (reading 'catch')`。
+- Codex Voice 在 Mac 上仍保持打开，但 Live 页没有恢复按住说话按钮。
+
+**边界证据与根因**
+
+- 故障发生在 PWA 将后台 runtime 重新设为前台时，不在 Control API、Bridge 或 Codex Voice 边界。
+- LiveKit `RemoteTrackPublication.setSubscribed(boolean)` 是同步返回 `void` 的 API。前端错误地在返回值上调用 `.catch()`；切换时执行远端音轨 unsubscribe/subscribe，因而读取 `undefined.catch`。
+- 异常中止了后续 `ensure-voice` 和 `voiceReady=true`，所以即使 Mac 上 Voice 仍打开，PTT 也会被隐藏。
+
+**已实施处理**
+
+- 远端音轨订阅切换统一改为同步调用；同步异常由正确的上层失败路径处理。
+- 两处不应阻塞 UI 的后台化调用显式持有 runtime，并只在真实 Promise 上处理 rejection，避免可选链与 Promise 语义混用。
+- `resumePlayback()` 在恢复前重新确认远端 track 已附着到实际 audio element；刷新恢复后若浏览器阻止自动播放，Live 页下一次正常用户手势会直接恢复该 element，不增加额外“启用音频”按钮。
+
+**验证**
+
+- PWA lint 与 production build 通过；尚待用户在 Mono/Raymond 真机往返切换复验。
+
 ## 新故障登记流程
 
 1. 用用户可见症状和日志关键词检索本文件；优先匹配相同故障边界，不只匹配相似文案。
