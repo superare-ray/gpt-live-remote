@@ -175,9 +175,21 @@ type PhoneControlMessage =
   | { type: "client.media.status"; stage: "microphone_published" | "ptt_unmute_requested" | "ptt_unmuted" | "ptt_muted" | "rtc_stats" | "track_subscribed" | "track_unsubscribed" | "playback_ready" | "playback_blocked" | "playback_error"; detail?: string }
   | { type: "session.content.history.request"; before?: string | null; limit?: number };
 
-const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie"] } });
+const app = Fastify({
+  logger: { redact: ["req.headers.authorization", "req.headers.cookie"] },
+  // The public entrypoint is the local Nginx reverse proxy. Trust only that
+  // hop so request.ip resolves to the real client without accepting spoofed
+  // forwarding headers from direct connections.
+  trustProxy: (address) => address === "127.0.0.1" || address === "::1",
+});
 await app.register(cookie);
-await app.register(rateLimit, { global: false });
+await app.register(rateLimit, {
+  global: false,
+  errorResponseBuilder: (_request, context) => ({
+    statusCode: 429,
+    error: `请求过于频繁，请在 ${Math.max(1, Math.ceil(context.ttl / 1_000))} 秒后重试`,
+  }),
+});
 await app.register(websocket);
 
 const bridgeSockets = new Map<string, WebSocket>();

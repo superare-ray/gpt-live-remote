@@ -34,6 +34,8 @@
 | KI-016 | 蓝牙断开后声音落到听筒且很小 | 移动系统通信音频路由 | 平台能力边界 |
 | KI-017 | 切换设备必须先停旧设备，且跳离 Live 页 | PWA 单例媒体 runtime/账号单租约 | 已实施待复验 |
 | KI-018 | dropdown 不切页、切回不重启 Voice、设备按钮常驻 loading、静音无效 | PWA 前台切换 / Voice 复核 / 播放状态 | 已实施待复验 |
+| KI-019 | 切回后台设备时报 `undefined.catch`，PTT 不恢复 | PWA 对 LiveKit 同步 API 的错误 Promise 处理 | 已实施待复验 |
+| KI-020 | 获取邮箱验证码提示 Too Many Requests | Nginx → Control API 真实 IP / 前端重复提交 | 已实施待复验 |
 
 ## KI-001：子路径发生 308 重定向循环
 
@@ -334,6 +336,27 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 **验证**
 
 - PWA lint 与 production build 通过；尚待用户在 Mono/Raymond 真机往返切换复验。
+
+## KI-020：获取邮箱验证码提示 Too Many Requests
+
+**症状与边界证据**
+
+- 用户刷新后输入邮箱并获取验证码，前端直接显示英文 `Too Many Requests`。
+- 2026-08-15 Control 日志确认 `/api/v1/auth/email/start` 在10分钟内达到第6次请求后返回 HTTP 429；路由规则为每10分钟最多5次。
+- Fastify 日志中所有公网请求的 `remoteAddress` 都是 `127.0.0.1`。服务位于本机 Nginx 后，但 Fastify 未配置可信代理，因此默认限流 key 把所有用户归入同一个回环地址桶。
+- PWA 获取验证码按钮没有请求中状态；一次请求尚未返回时仍可重复点击，进一步加速耗尽限额。
+
+**已实施处理**
+
+- Control API 仅信任 `127.0.0.1`/`::1` 的本机反向代理，使默认限流 key 使用经过可信代理链解析的真实客户端 IP；直接访问 Control 端口时不接受伪造的 `X-Forwarded-For`。
+- 保留每 IP 10 分钟5次的安全边界以及每邮箱60秒冷却，不改验证码有效期或验证次数。
+- 429 响应改成带实际剩余秒数的中文可行动错误。
+- PWA 请求期间禁用发送按钮；成功后保持60秒前端冷却，防止返回修改邮箱后立即重复提交。
+
+**验证**
+
+- 隔离 Fastify 注入验证：可信本机代理正确解析测试客户端 IP；非可信直连忽略伪造转发头。
+- Control API typecheck/build 与 PWA lint/build 通过。尚未部署和由真实手机复验。
 
 ## 新故障登记流程
 

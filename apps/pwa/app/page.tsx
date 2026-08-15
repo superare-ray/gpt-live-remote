@@ -141,6 +141,8 @@ export default function Home() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
+  const [sendingLoginCode, setSendingLoginCode] = useState(false);
+  const [loginCodeCooldown, setLoginCodeCooldown] = useState(0);
   const [loginStep, setLoginStep] = useState<"email" | "code">("email");
   const [devices, setDevices] = useState<Device[]>([]);
   const [sessions, setSessions] = useState<Record<string, RemoteSession>>({});
@@ -175,6 +177,14 @@ export default function Home() {
   const voiceControlsRef = useRef<HTMLDivElement | null>(null);
   const deviceMenuRef = useRef<HTMLDivElement | null>(null);
   const connectDeviceRef = useRef<(device: Device, reconnect?: boolean) => Promise<void>>(async () => undefined);
+
+  useEffect(() => {
+    if (loginCodeCooldown <= 0) return;
+    const timer = window.setTimeout(() => {
+      setLoginCodeCooldown((seconds) => Math.max(0, seconds - 1));
+    }, 1_000);
+    return () => window.clearTimeout(timer);
+  }, [loginCodeCooldown]);
 
   useEffect(() => {
     devicesRef.current = devices;
@@ -595,12 +605,17 @@ export default function Home() {
 
   async function sendLoginCode(event: FormEvent) {
     event.preventDefault();
+    if (sendingLoginCode || loginCodeCooldown > 0) return;
+    setSendingLoginCode(true);
     setNotice(null);
     try {
       await request("/api/v1/auth/email/start", { method: "POST", body: JSON.stringify({ email }) });
+      setLoginCodeCooldown(60);
       setLoginStep("code");
     } catch (error) {
       setNotice((error as Error).message);
+    } finally {
+      setSendingLoginCode(false);
     }
   }
 
@@ -796,7 +811,9 @@ export default function Home() {
           <form className="stack" onSubmit={sendLoginCode}>
             <label htmlFor="email">邮箱</label>
             <input id="email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required />
-            <button className="primary" type="submit">获取验证码</button>
+            <button className="primary" type="submit" disabled={sendingLoginCode || loginCodeCooldown > 0}>
+              {sendingLoginCode ? "正在发送" : loginCodeCooldown > 0 ? `${loginCodeCooldown} 秒后重试` : "获取验证码"}
+            </button>
           </form>
         ) : (
           <form className="stack" onSubmit={verifyLogin}>
