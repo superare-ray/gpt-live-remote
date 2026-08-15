@@ -134,9 +134,11 @@ input:-webkit-autofill:focus { color: var(--text) !important; -webkit-text-fill-
 .history-loading svg { width: 14px; height: 14px; }
 .voice-controls, .voice-controls * { user-select: none !important; -webkit-user-select: none !important; -webkit-touch-callout: none !important; }
 .voice-controls { position: fixed; z-index: 10; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); width: min(calc(100% - 32px), 488px); transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; pointer-events: none; }
-.voice-dots { position: fixed; z-index: 9; top: 50%; left: 50%; width: min(calc(100% - 32px), 488px); height: 48px; transform: translate(-50%, -50%); display: flex; align-items: center; justify-content: center; gap: 8px; pointer-events: none; }
-.voice-dots i { width: 8px; min-height: 8px; border-radius: 999px; background: var(--sage-strong); opacity: .42; box-shadow: 0 0 16px rgba(184,207,188,.1); transition: height 45ms linear, opacity 120ms ease; }
-.voice-dots.active i { opacity: .96; }
+.voice-orb { position: fixed; z-index: 9; top: 50%; left: 50%; width: 172px; height: 172px; transform: translate(-50%, -50%); pointer-events: none; }
+.voice-orb canvas { width: 100%; height: 100%; display: block; opacity: 0; transition: opacity 180ms ease; }
+.voice-orb canvas.ready { opacity: 1; }
+.voice-orb-fallback { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.voice-orb-fallback i { width: 8px; min-height: 8px; border-radius: 999px; background: var(--sage-strong); opacity: .72; box-shadow: 0 0 16px rgba(184,207,188,.1); transition: height 45ms linear; }
 .ptt { position: relative; width: min(54vw, 208px); height: 52px; flex: 0 0 52px; padding: 0 22px; border: 1px solid rgba(184,207,188,.34); border-radius: 26px; color: var(--bg); background: linear-gradient(135deg, var(--sage-strong), #8fad97); display: grid; place-items: center; pointer-events: auto; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; box-shadow: 0 9px 20px rgba(3,12,8,.36), inset 0 1px 0 rgba(255,255,255,.2); transform: scale(1); transition: transform 150ms cubic-bezier(.2,.8,.25,1), filter 120ms ease, box-shadow 150ms ease; }
 .ptt-label { font-size: 15px; font-weight: 650; letter-spacing: .02em; color: inherit; pointer-events: none; }
 .ptt:not(:disabled):active, .ptt.pressed { transform: scale(.95); filter: brightness(.86); box-shadow: 0 3px 8px rgba(3,12,8,.3), inset 0 3px 7px rgba(7,16,11,.24); transition-duration: 70ms; }

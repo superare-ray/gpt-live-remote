@@ -26,6 +26,7 @@ import {
   type RuntimeSession as RemoteSession,
   type RuntimeSnapshot,
 } from "./device-session-runtime";
+import { AudioReactiveOrb } from "./audio-reactive-orb";
 
 type AuthUser = { id: string; email: string };
 type DeviceKind = "phone" | "tablet" | "macbook" | "macmini";
@@ -866,9 +867,7 @@ export default function Home() {
         <section className="voice-stage">
           <div className="voice-space" aria-hidden />
           {mediaConnected && (
-            <div className={`voice-dots ${talking || Math.max(...waveLevels) > 0.05 ? "active" : ""}`} aria-hidden>
-              {waveLevels.map((level, index) => <i key={index} style={{ height: `${8 + level * 28}px` }} />)}
-            </div>
+            <AudioReactiveOrb levels={waveLevels} />
           )}
           {voiceReady && mediaConnected && (
             <div className="voice-controls" ref={voiceControlsRef}>
