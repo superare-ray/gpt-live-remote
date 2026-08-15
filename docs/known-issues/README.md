@@ -356,7 +356,7 @@ Codex Voice 连接后不保证主动打招呼。不得等待“真实音频活�
 **验证**
 
 - 隔离 Fastify 注入验证：可信本机代理正确解析测试客户端 IP；非可信直连忽略伪造转发头。
-- Control API typecheck/build 与 PWA lint/build 通过。尚未部署和由真实手机复验。
+- 2026-08-15 已部署 commit `1a1f881`；Control API typecheck/build、PWA lint/build、Nginx 语法、Control health 与公网 PWA HTTP 200 均通过。服务重启同时清空了旧的进程内共享限流桶；尚待用户从真实手机请求一次验证码复验。
 
 ## 新故障登记流程
 
